@@ -1,0 +1,30 @@
+# Diffusion Policy (state-based) training + evaluation. Conditions differ only
+# in data.num_demos and seed (see configs/sweep.yaml).
+seed: 0
+data:
+  path: data/demos_baseline.npz
+  num_demos: 100                       # first N successful demos in seed order (nested subsets)
+policy:
+  obs_horizon: 2                       # To
+  pred_horizon: 16                     # Tp
+  action_horizon: 8                    # Ta: actions executed per inference
+  down_dims: [128, 256, 512]
+  diffusion_step_embed_dim: 128
+  kernel_size: 5
+  n_groups: 8
+  num_train_timesteps: 100             # DDPM steps (squaredcos_cap_v2)
+  num_inference_steps: 100             # 100 = full DDPM chain; fewer = DDIM
+train:
+  num_steps: 20000                     # gradient steps, identical for every dataset size
+  batch_size: 256
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  warmup_steps: 500
+  ema_power: 0.75
+  log_every: 100
+eval:
+  num_episodes: 100                    # held-out initial conditions
+  seed_offset: 100000                  # eval seeds 100000..100099, disjoint from demo seeds
+  batch_size: 100
+  num_videos: 2                        # successes and failures rendered each
+  success_threshold: 0.05

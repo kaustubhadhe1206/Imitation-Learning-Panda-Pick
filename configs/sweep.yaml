@@ -1,0 +1,12 @@
+# Option A ablation: dataset quantity. Every run uses configs/dp_base.yaml and
+# differs only in data.num_demos and the training seed. Runs are ordered
+# seed-major so that a partial sweep still contains every condition.
+base_config: configs/dp_base.yaml
+seeds: [0, 1, 2]
+conditions:
+  - name: n100
+    num_demos: 100
+  - name: n50
+    num_demos: 50
+  - name: n25
+    num_demos: 25

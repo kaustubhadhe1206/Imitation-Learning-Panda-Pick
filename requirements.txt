@@ -1,0 +1,13 @@
+# Simulation: MuJoCo Playground (PandaPickCube), JAX backend on CUDA 12.
+# Exact resolved versions are recorded in every results JSON ("env_info").
+playground==0.2.0
+jax[cuda12]
+# PyTorch (policy) is preinstalled on Colab; slurm/setup_carc.sh installs it on CARC.
+# Rendering / video
+imageio
+imageio-ffmpeg
+pillow
+# Analysis / configs / tests
+pyyaml
+matplotlib
+pytest

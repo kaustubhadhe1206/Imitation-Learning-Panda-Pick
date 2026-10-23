@@ -1,0 +1,13 @@
+# Demonstration collection with the scripted expert (code/collect_demos.py).
+name: baseline
+out: data/demos_baseline.npz           # all attempts + labels (committed: a few MB)
+summary_out: results/demos/collection_baseline.json
+num_success: 100                       # collect until this many successful episodes
+seed_start: 0                          # demo seeds are 0, 1, 2, ... (eval seeds start at 100000)
+max_attempts: 400
+batch_size: 50                         # envs simulated in parallel (fixed -> one jit compile)
+noise_std: 0.0                         # Option B: Gaussian noise on executed actions (then clipped)
+noise_seed: 0
+success_threshold: 0.05                # m, box-to-target distance at the final step
+verify_replay: true                    # replay stored actions open-loop and check obs match
+expert: {}                             # overrides of hw2.expert.DEFAULT_EXPERT_CFG

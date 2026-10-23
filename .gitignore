@@ -1,0 +1,12 @@
+# Large / regenerable artifacts (checkpoints, raw rollouts)
+runs/
+*.pt
+# Scratch output of the smoke test
+results/smoke/
+videos/smoke/
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+slurm/logs/
