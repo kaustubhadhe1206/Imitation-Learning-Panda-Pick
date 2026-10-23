@@ -35,7 +35,7 @@ edit a `.py` file on the runtime, commit + push it (last cell) before the sessio
 
 code(r"""
 # ---- 0. Settings ----------------------------------------------------------------------------
-REPO_URL = "https://github.com/<github-user>/<repo-name>.git"   # private repo (no token here!)
+REPO_URL = "https://github.com/kaustubhadhe1206/Imitation-Learning-Panda-Pick.git"   # private repo (no token here!)
 BRANCH = "main"
 GIT_NAME, GIT_EMAIL = "kashinadhe", "kaustubhadhe@gmail.com"
 
