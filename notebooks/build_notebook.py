@@ -39,7 +39,7 @@ edit a `.py` file on the runtime, commit + push it (last cell) before the sessio
 
 code(r"""
 # ---- 0. Settings ----------------------------------------------------------------------------
-REPO_URL = "https://github.com/kaustubhadhe1206/Imitation-Learning-Panda-Pick.git"   # private repo (no token here!)
+REPO_URL = "https://github.com/kaustubhadhe1206/Imitation-Learning-Panda-Pick.git"   # never put a token here
 BRANCH = "main"
 GIT_NAME, GIT_EMAIL = "kashinadhe", "kaustubhadhe@gmail.com"
 DRIVE_FOLDER = "CSCI-645 Homework 2"     # Colab: all outputs are stored in My Drive/<this folder>
@@ -57,29 +57,35 @@ print("platform:", "Colab" if IN_COLAB else "CARC/other", "| repo:", REPO)
 """)
 
 code(r"""
-# ---- 1. GitHub access (token is typed, never saved) + clone / pull ---------------------------
-# Use a fine-grained personal access token restricted to this one repo,
-# permission "Contents: Read and write" (write is needed to push results back).
+# ---- 1. Clone / pull (public repo: no token needed) -----------------------------------------
+# A token is OPTIONAL and only used to push results (CSVs, figures, videos) back to GitHub, so
+# they show up in the repo without downloading them from Drive. Press Enter to skip it.
+# If used: fine-grained token for this one repo, permission "Contents: Read and write".
 from getpass import getpass
-if not os.environ.get("GH_TOKEN"):
-    os.environ["GH_TOKEN"] = getpass("GitHub fine-grained token: ")
-auth_url = REPO_URL.replace("https://", f"https://x-access-token:{os.environ['GH_TOKEN']}@")
-os.environ["HW2_PUSH_URL"] = auth_url                  # used by run_sweep.py --push
+if "GH_TOKEN" not in os.environ:
+    os.environ["GH_TOKEN"] = getpass("GitHub token for pushing results (Enter to skip): ").strip()
+TOKEN = os.environ["GH_TOKEN"]
+CAN_PUSH = bool(TOKEN)
+if CAN_PUSH:
+    os.environ["HW2_PUSH_URL"] = REPO_URL.replace("https://", f"https://x-access-token:{TOKEN}@")
+else:
+    os.environ.pop("HW2_PUSH_URL", None)               # run_sweep.py --push then skips pushing
+print("GitHub push:", "enabled" if CAN_PUSH else "disabled (outputs are kept on Drive only)")
 
 def git(*args, check=True):
     r = subprocess.run(["git", *args], cwd=REPO if REPO.exists() else None, capture_output=True, text=True)
-    out = (r.stdout + r.stderr).replace(os.environ["GH_TOKEN"], "***")
+    out = r.stdout + r.stderr
+    if TOKEN: out = out.replace(TOKEN, "***")
     if out.strip(): print(out.strip())
     if check and r.returncode: raise RuntimeError(f"git {args[0]} failed")
     return r
 
 if not (REPO / ".git").exists():
-    r = subprocess.run(["git", "clone", "-q", "-b", BRANCH, auth_url, str(REPO)], capture_output=True, text=True)
-    if r.returncode: raise RuntimeError("clone failed: " + r.stderr.replace(os.environ["GH_TOKEN"], "***"))
-    git("remote", "set-url", "origin", REPO_URL)       # keep the token out of .git/config
+    git("clone", "-q", "-b", BRANCH, REPO_URL, str(REPO))
 else:
-    git("pull", "--ff-only", auth_url, BRANCH)
-git("config", "user.name", GIT_NAME); git("config", "user.email", GIT_EMAIL)
+    git("pull", "--ff-only", REPO_URL, BRANCH)
+if CAN_PUSH:
+    git("config", "user.name", GIT_NAME); git("config", "user.email", GIT_EMAIL)
 os.chdir(REPO)
 git("log", "--oneline", "-3")
 """)
@@ -100,7 +106,8 @@ if IN_COLAB:
         STORAGE = pathlib.Path("/content/drive/MyDrive") / DRIVE_FOLDER
     except Exception as e:
         print("WARNING: Google Drive could not be mounted (" + repr(e)[:200] + ").\n"
-              "Outputs stay on the VM; results are still pushed to GitHub after each step.")
+              "Outputs stay on the VM" + ("; results are still pushed to GitHub after each step." if CAN_PUSH
+              else " and are LOST on disconnect. Re-run cell 1 with a GitHub token to push them."))
 if STORAGE is not None:
     for sub in ["runs", "logs", "data", "results", "videos"]:
         (STORAGE / sub).mkdir(parents=True, exist_ok=True)
@@ -153,8 +160,9 @@ def sh(cmd):
     if code: raise RuntimeError(f"command failed ({code}): {cmd}")
 
 def push(paths, message):
-    # Save outputs to Drive, then commit the given paths (if changed) and push to GitHub.
+    # Save outputs to Drive, then (if a token was given) commit the given paths and push to GitHub.
     save_to_drive()
+    if not CAN_PUSH: return print("GitHub push skipped (no token)")
     paths = [p for p in paths if (REPO / p).exists()]
     if not paths: return print("nothing to push")
     git("add", "-f", *paths)
