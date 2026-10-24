@@ -29,6 +29,10 @@ Every cell only shells out to the scripts in `code/`, so the notebook does exact
 command-line / SLURM workflow does. Steps are **resumable**: finished results are committed to
 GitHub, and re-running a cell skips work that is already done.
 
+**Storage (Colab):** all outputs go to `My Drive/CSCI-645 Homework 2/`. That covers checkpoints and raw rollouts in `runs/`,
+copies of `data/`, `results/` and `videos/`, and a log of every command in `logs/`. A disconnect therefore never
+loses a trained model. Python packages and the git clone live on the VM and are reinstalled each session.
+
 **Rules for edits:** change behaviour through `--set key=value` overrides where possible. If you
 edit a `.py` file on the runtime, commit + push it (last cell) before the session ends.
 """)
@@ -38,6 +42,7 @@ code(r"""
 REPO_URL = "https://github.com/kaustubhadhe1206/Imitation-Learning-Panda-Pick.git"   # private repo (no token here!)
 BRANCH = "main"
 GIT_NAME, GIT_EMAIL = "kashinadhe", "kaustubhadhe@gmail.com"
+DRIVE_FOLDER = "CSCI-645 Homework 2"     # Colab: all outputs are stored in My Drive/<this folder>
 
 import os, sys, subprocess, pathlib, shlex
 IN_COLAB = os.path.isdir("/content") and not os.environ.get("SLURM_JOB_ID")
@@ -80,6 +85,45 @@ git("log", "--oneline", "-3")
 """)
 
 code(r"""
+# ---- 1b. Google Drive storage (Colab only) --------------------------------------------------
+# My Drive/CSCI-645 Homework 2/
+#   runs/      checkpoints + raw rollouts (repo's runs/ is a symlink here, so they survive disconnects)
+#   data/ results/ videos/   copies of everything the pipeline produces (refreshed after each step)
+#   logs/      full console output of every pipeline command
+# Packages and the git clone stay on the VM disk (Drive is too slow for imports / git).
+import shutil, datetime
+STORAGE = None
+if IN_COLAB:
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive")
+        STORAGE = pathlib.Path("/content/drive/MyDrive") / DRIVE_FOLDER
+    except Exception as e:
+        print("WARNING: Google Drive could not be mounted (" + repr(e)[:200] + ").\n"
+              "Outputs stay on the VM; results are still pushed to GitHub after each step.")
+if STORAGE is not None:
+    for sub in ["runs", "logs", "data", "results", "videos"]:
+        (STORAGE / sub).mkdir(parents=True, exist_ok=True)
+    runs = REPO / "runs"
+    if runs.exists() and not runs.is_symlink():          # move anything created before the mount
+        shutil.copytree(runs, STORAGE / "runs", dirs_exist_ok=True)
+        shutil.rmtree(runs)
+    if not runs.is_symlink():
+        runs.symlink_to(STORAGE / "runs", target_is_directory=True)
+    os.environ["HW2_MIRROR_DIR"] = str(STORAGE)           # run_sweep.py copies each finished run here
+    print("Drive storage:", STORAGE)
+    print("existing checkpoints:", sorted(p.parent.name for p in (STORAGE / "runs").glob("*/checkpoint.pt")))
+
+def save_to_drive():
+    # Copy data/, results/, videos/ from the repo into the Drive folder (no-op without Drive).
+    if STORAGE is None: return
+    for sub in ["data", "results", "videos"]:
+        if (REPO / sub).exists():
+            shutil.copytree(REPO / sub, STORAGE / sub, dirs_exist_ok=True)
+    print("saved to Drive:", STORAGE)
+""")
+
+code(r"""
 # ---- 2. Install (Colab only; CARC uses the venv built by slurm/setup_carc.sh) ----------------
 if IN_COLAB:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"], check=True)
@@ -93,14 +137,24 @@ os.environ["MUJOCO_GL"] = "egl"
 subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv"])
 
 def sh(cmd):
-    # Run a pipeline command from the repo root, streaming its output; raise on failure.
+    # Run a pipeline command from the repo root, streaming its output (and logging it to Drive); raise on failure.
     print("$", cmd, flush=True)
+    log = None
+    if STORAGE is not None:
+        name = "-".join(pathlib.Path(a).stem for a in shlex.split(cmd)[1:3])
+        log = open(STORAGE / "logs" / f"{datetime.datetime.now():%Y%m%d-%H%M%S}_{name}.log", "w")
+        log.write(f"$ {cmd}\n")
     p = subprocess.Popen(shlex.split(cmd), cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in p.stdout: print(line, end="")
-    if p.wait(): raise RuntimeError(f"command failed ({p.returncode}): {cmd}")
+    for line in p.stdout:
+        print(line, end="")
+        if log: log.write(line); log.flush()
+    code = p.wait()
+    if log: log.close()
+    if code: raise RuntimeError(f"command failed ({code}): {cmd}")
 
 def push(paths, message):
-    # Commit the given paths (if changed) and push to GitHub.
+    # Save outputs to Drive, then commit the given paths (if changed) and push to GitHub.
+    save_to_drive()
     paths = [p for p in paths if (REPO / p).exists()]
     if not paths: return print("nothing to push")
     git("add", "-f", *paths)
@@ -175,8 +229,9 @@ if RUN_SANITY:
 
 md(r"""
 ## Parts 2-3: Train + evaluate the dataset-size sweep (resumable)
-Runs `configs/sweep.yaml` (100 / 50 / 25 demos x seeds 0, 1, 2). Each finished run is pushed
-immediately. If the session dies, reconnect, run cells 0-2, then this cell again.
+Runs `configs/sweep.yaml` (100 / 50 / 25 demos x seeds 0, 1, 2). Each finished run is copied to
+Drive and pushed to GitHub immediately. Checkpoints are written straight to Drive, so a run whose training
+finished is not retrained. If the session dies, reconnect, run cells 0-2 (incl. 1b), then this cell again.
 """)
 
 code(r"""

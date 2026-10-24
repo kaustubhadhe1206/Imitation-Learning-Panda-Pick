@@ -43,6 +43,19 @@ def git_sync(paths, message):
   print("  pushed" if r.returncode == 0 else "  push FAILED: " + r.stderr.replace(url, "<url>")[-300:])
 
 
+def mirror_run(name, res_dir):
+  """Copy a finished run's results and videos to HW2_MIRROR_DIR (e.g. a Google Drive folder)."""
+  import os
+  mirror = os.environ.get("HW2_MIRROR_DIR")
+  if not mirror:
+    return
+  videos = utils.REPO_ROOT / "videos" / "student" / name
+  shutil.copytree(res_dir, os.path.join(mirror, "results", "runs", name), dirs_exist_ok=True)
+  if videos.exists():
+    shutil.copytree(videos, os.path.join(mirror, "videos", "student", name), dirs_exist_ok=True)
+  print(f"  copied to {mirror}")
+
+
 def run(cmd):
   print("  $", " ".join(cmd), flush=True)
   subprocess.run([sys.executable, *cmd], cwd=str(utils.REPO_ROOT), check=True)
@@ -84,6 +97,7 @@ def main():
     for f in ["loss.csv", "train_summary.json", "config.yaml", "loss_curve.png"]:
       shutil.copy2(run_dir / f, res_dir / f)
     print(f"[done] {name} in {(time.time() - t0) / 60:.1f} min", flush=True)
+    mirror_run(name, res_dir)
     if args.push:
       git_sync([res_dir, utils.REPO_ROOT / "videos" / "student" / name], f"results: {name}")
 
