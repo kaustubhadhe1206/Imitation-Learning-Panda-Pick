@@ -22,7 +22,7 @@ python -m ipykernel install --user --name hw2 --display-name "Python (hw2)"
 JAX_PLATFORMS=cpu python -c "
 import sys; sys.path.insert(0, 'code')
 import hw2
-from hw2.envs import load_env
-env = load_env(); print('PandaPickCube loaded, action size', env.action_size)
+from hw2.envs import load_pick_cube_env
+env = load_pick_cube_env(); print('PandaPickCube loaded, action size', env.action_size)
 "
 echo "Done. Activate with: source $VENV/bin/activate"

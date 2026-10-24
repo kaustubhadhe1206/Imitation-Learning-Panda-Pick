@@ -101,7 +101,7 @@ filtering is reported).
 - Evaluation: env seeds 100000-100099 (100 held-out initial conditions), the same for every condition and for the teacher.
 - Training seeds: 0, 1, 2.
 
-**Provenance.** Every JSON in `results/` contains `env_info` (Python, GPU, package versions,
+**Provenance.** Every JSON in `results/` contains `system_info` (Python, GPU, package versions,
 git commit), and every run directory contains its fully resolved `config.yaml`.
 
 ## References

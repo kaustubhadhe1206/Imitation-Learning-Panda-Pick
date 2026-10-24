@@ -1,18 +1,18 @@
-"""Environment + pipeline smoke test. Run this first on a new machine/runtime.
+"""Quick check that everything works on a new machine. Run this first.
 
-Sections (all by default):
-  env     versions, devices, PandaPickCube dims/ranges, jit + step timing
-  expert  scripted expert on one batch of seeds: success rate, failure modes,
-          phase durations (also the quick loop for tuning the expert:
-          --set expert.v_approach=0.025 ...)
-  render  one PNG frame + one expert video
-  torch   Diffusion Policy training / inference speed -> time estimates
+Checks (all of them by default):
+  env      versions, GPU, PandaPickCube sizes and ranges, compile + step time
+  expert   scripted expert on one batch of seeds: success rate, failure types,
+           time per phase. Also the quick way to tune the expert, e.g.
+           --set expert.approach_speed=0.025
+  render   one PNG image + one expert video
+  torch    Diffusion Policy training / sampling speed -> time estimates
 
-Ends with a compact JSON block to paste back.
+At the end it prints a short JSON report to paste back.
 
 Usage:
   python code/smoke_test.py
-  python code/smoke_test.py --sections expert render --set expert.close_steps=10
+  python code/smoke_test.py --checks expert render --set expert.gripper_close_steps=10
 """
 
 import argparse
@@ -28,180 +28,189 @@ from hw2 import utils
 REPORT = {}
 
 
-def section(name):
-  def deco(fn):
-    def wrapped(*a, **k):
+def report_section(name):
+  """Decorator: run a check, store whether it worked (and how long it took) in REPORT, never crash."""
+  def decorator(check_function):
+    def wrapper(*args, **kwargs):
       print(f"\n===== {name} =====", flush=True)
-      t0 = time.time()
+      start_time = time.time()
       try:
-        fn(*a, **k)
+        check_function(*args, **kwargs)
         REPORT.setdefault(name, {})["ok"] = True
-      except Exception as e:  # report and continue with the other sections
+      except Exception as error:   # print the error and keep going with the other checks
         traceback.print_exc()
-        REPORT.setdefault(name, {}).update({"ok": False, "error": repr(e)[:500]})
-      REPORT[name]["seconds"] = round(time.time() - t0, 1)
-    return wrapped
-  return deco
+        REPORT.setdefault(name, {}).update({"ok": False, "error": repr(error)[:500]})
+      REPORT[name]["seconds"] = round(time.time() - start_time, 1)
+    return wrapper
+  return decorator
 
 
-@section("env")
-def check_env(ctx):
+@report_section("env")
+def check_environment(shared):
   import jax
-  info = utils.env_info()
-  REPORT["env"] = {"packages": info["packages"], "gpu": info.get("gpu"), "python": info["python"],
-                   "jax_devices": [str(d) for d in jax.devices()]}
+  system_info = utils.get_system_info()
+  REPORT["env"] = {"packages": system_info["packages"], "gpu": system_info.get("gpu"),
+                   "python": system_info["python"], "jax_devices": [str(d) for d in jax.devices()]}
   print(json.dumps(REPORT["env"], indent=2))
 
-  from hw2.envs import BatchedEnv, env_config_dict
-  t0 = time.time()
-  benv = BatchedEnv()
-  ctx["benv"] = benv
-  m = benv.mj_model
-  cfg = env_config_dict()
-  dims = {
-      "action_dim": benv.action_size, "nq": m.nq, "nv": m.nv, "nu": m.nu,
-      "ctrl_range": m.actuator_ctrlrange.round(4).tolist(),
-      "episode_length": benv.episode_length, "ctrl_dt": cfg["ctrl_dt"], "sim_dt": cfg["sim_dt"],
-      "action_scale": benv.action_scale, "impl": cfg.get("impl"),
+  from hw2.envs import BatchedPickCubeEnv, get_env_config
+  start_time = time.time()
+  batched_env = BatchedPickCubeEnv()
+  shared["batched_env"] = batched_env
+  model = batched_env.mj_model
+  env_config = get_env_config()
+  sizes = {
+      "action_dim": batched_env.action_size, "nq": model.nq, "nv": model.nv, "nu": model.nu,
+      "ctrl_range": model.actuator_ctrlrange.round(4).tolist(),
+      "episode_length": batched_env.episode_length, "ctrl_dt": env_config["ctrl_dt"],
+      "sim_dt": env_config["sim_dt"], "action_scale": batched_env.action_scale, "impl": env_config.get("impl"),
   }
-  REPORT["env"].update(dims)
-  print(json.dumps(dims, indent=2))
+  REPORT["env"].update(sizes)
+  print(json.dumps(sizes, indent=2))
 
-  B = ctx["batch"]
-  seeds = np.arange(B)
-  state = benv.reset(seeds)
-  snap = benv.snapshot(state)
-  t1 = time.time()
-  state = benv.step(state, np.zeros((B, benv.action_size), np.float32))
-  benv.snapshot(state)
-  t2 = time.time()
+  batch_size = shared["batch_size"]
+  zero_actions = np.zeros((batch_size, batched_env.action_size), np.float32)
+  sim_state = batched_env.reset(np.arange(batch_size))
+  env_state = batched_env.to_numpy(sim_state)
+  reset_done = time.time()
+  sim_state = batched_env.step(sim_state, zero_actions)
+  batched_env.to_numpy(sim_state)
+  first_step_done = time.time()
   for _ in range(20):
-    state = benv.step(state, np.zeros((B, benv.action_size), np.float32))
-    benv.snapshot(state)
-  t3 = time.time()
+    sim_state = batched_env.step(sim_state, zero_actions)
+    batched_env.to_numpy(sim_state)
+  twenty_steps_done = time.time()
   REPORT["env"].update({
-      "load_and_reset_compile_s": round(t1 - t0, 1), "step_compile_s": round(t2 - t1, 1),
-      "batched_step_ms": round(1000 * (t3 - t2) / 20, 1), "batch": B,
-      "obs_dim": int(snap["obs"].shape[-1]),
-      "box_init_example": snap["box_pos"][0].round(3).tolist(),
-      "target_example": snap["target_pos"][0].round(3).tolist(),
-      "grip_init_example": snap["grip_pos"][0].round(3).tolist(),
+      "load_and_reset_compile_s": round(reset_done - start_time, 1),
+      "step_compile_s": round(first_step_done - reset_done, 1),
+      "batched_step_ms": round(1000 * (twenty_steps_done - first_step_done) / 20, 1),
+      "batch": batch_size,
+      "obs_dim": int(env_state["obs"].shape[-1]),
+      "box_init_example": env_state["box_pos"][0].round(3).tolist(),
+      "target_example": env_state["target_pos"][0].round(3).tolist(),
+      "grip_init_example": env_state["grip_pos"][0].round(3).tolist(),
   })
-  print({k: REPORT["env"][k] for k in ["load_and_reset_compile_s", "step_compile_s", "batched_step_ms"]})
+  print({key: REPORT["env"][key] for key in ["load_and_reset_compile_s", "step_compile_s", "batched_step_ms"]})
 
 
-@section("expert")
-def check_expert(ctx, overrides):
-  from hw2.expert import PHASE_NAMES, ExpertController
-  from hw2.rollout import classify_failures, rollout
-  benv = ctx["benv"]
-  cfg = utils.load_config("configs/collect.yaml", overrides)
-  ctrl = ExpertController(benv.mj_model, benv.action_scale, cfg["expert"])
-  seeds = np.arange(ctx["batch"])
-  t0 = time.time()
-  r = rollout(benv, seeds, ctrl, benv.episode_length, success_threshold=cfg["success_threshold"])
-  ctx["expert_result"] = r
-  modes = classify_failures(r)
-  succ = r["success"]
-  phase = r["phase"]
-  rep = {
-      "success_rate": float(succ.mean()),
-      "failure_modes": {m: int((modes == m).sum()) for m in np.unique(modes)},
-      "final_dist_cm": {"median": float(100 * np.median(r["dist"][:, -1])),
-                        "max_success": float(100 * r["dist"][succ, -1].max()) if succ.any() else None},
-      "first_success_step_mean": float(r["first_success_step"][succ].mean()) if succ.any() else None,
-      "phase_steps_mean": {n: float((phase == i).sum(axis=1).mean()) for i, n in enumerate(PHASE_NAMES)},
-      "final_phase_counts": {PHASE_NAMES[p]: int((phase[:, -1] == p).sum()) for p in np.unique(phase[:, -1])},
-      "regrasp_episodes": int((np.diff(phase.astype(int), axis=1) < 0).any(axis=1).sum()),
-      "reached_box_flag": float((r["reached_box"][:, -1] > 0.5).mean()),
-      "action_saturation_frac": float((np.abs(r["actions"]) > 0.999).mean()),
-      "min_grip_box_cm_median": float(100 * np.median(np.linalg.norm(r["grip_pos"] - r["box_pos"], axis=-1).min(1))),
-      "rollout_s": round(time.time() - t0, 1),
+@report_section("expert")
+def check_expert(shared, overrides):
+  from hw2.expert import PHASE_NAMES, BatchedExpertController
+  from hw2.rollout import label_failure_modes, run_episodes
+  batched_env = shared["batched_env"]
+  config = utils.load_config("configs/collect.yaml", overrides)
+  expert = BatchedExpertController(batched_env.mj_model, batched_env.action_scale, config["expert"])
+  start_time = time.time()
+  results = run_episodes(batched_env, np.arange(shared["batch_size"]), expert, batched_env.episode_length,
+                         success_threshold=config["success_threshold"])
+  shared["expert_results"] = results
+  failure_modes = label_failure_modes(results)
+  successful = results["success"]
+  phases = results["phase"]
+  gripper_to_box = np.linalg.norm(results["grip_pos"] - results["box_pos"], axis=-1)
+  expert_report = {
+      "success_rate": float(successful.mean()),
+      "failure_modes": {mode: int((failure_modes == mode).sum()) for mode in np.unique(failure_modes)},
+      "final_dist_cm": {"median": float(100 * np.median(results["dist"][:, -1])),
+                        "max_success": float(100 * results["dist"][successful, -1].max()) if successful.any() else None},
+      "first_success_step_mean": float(results["first_success_step"][successful].mean()) if successful.any() else None,
+      "phase_steps_mean": {name: float((phases == i).sum(axis=1).mean()) for i, name in enumerate(PHASE_NAMES)},
+      "final_phase_counts": {PHASE_NAMES[p]: int((phases[:, -1] == p).sum()) for p in np.unique(phases[:, -1])},
+      "regrasp_episodes": int((np.diff(phases.astype(int), axis=1) < 0).any(axis=1).sum()),
+      "reached_box_flag": float((results["reached_box"][:, -1] > 0.5).mean()),
+      "action_saturation_frac": float((np.abs(results["actions"]) > 0.999).mean()),
+      "min_grip_box_cm_median": float(100 * np.median(gripper_to_box.min(1))),
+      "rollout_s": round(time.time() - start_time, 1),
   }
-  fails = np.flatnonzero(~succ)[:5]
-  rep["failed_seeds"] = [int(s) for s in r["seeds"][fails]]
-  rep["failed_final_dist_cm"] = [round(float(100 * r["dist"][i, -1]), 1) for i in fails]
-  rep["failed_final_phase"] = [PHASE_NAMES[int(phase[i, -1])] for i in fails]
-  REPORT["expert"] = rep
-  print(json.dumps(rep, indent=2))
+  failed_ids = np.flatnonzero(~successful)[:5]
+  expert_report["failed_seeds"] = [int(seed) for seed in results["seeds"][failed_ids]]
+  expert_report["failed_final_dist_cm"] = [round(float(100 * results["dist"][i, -1]), 1) for i in failed_ids]
+  expert_report["failed_final_phase"] = [PHASE_NAMES[int(phases[i, -1])] for i in failed_ids]
+  REPORT["expert"] = expert_report
+  print(json.dumps(expert_report, indent=2))
 
 
-@section("render")
-def check_render(ctx):
-  from hw2.render import TrajectoryRenderer, annotate, write_video
-  benv = ctx["benv"]
-  out = utils.resolve_path("results/smoke")
-  out.mkdir(parents=True, exist_ok=True)
-  rend = TrajectoryRenderer(benv.mj_model, height=240, width=320)
-  r = ctx.get("expert_result")
-  if r is None:
-    state = benv.reset(np.arange(ctx["batch"]))
-    s = benv.snapshot(state)
-    frames = rend.render(s["qpos"][:1], s["target_pos"][0])
-  else:
-    i = int(np.argmax(r["success"])) if r["success"].any() else 0
-    frames = annotate(rend.render(r["qpos"][i], r["target_pos"][i], every=2),
-                      f"smoke test expert seed {int(r['seeds'][i])}")
-    REPORT["render"] = {"video": str(write_video(utils.resolve_path("videos/smoke/expert_smoke.mp4"), frames, 25))}
-    j = np.flatnonzero(~r["success"])
-    if len(j):
-      ff = annotate(rend.render(r["qpos"][j[0]], r["target_pos"][j[0]], every=2),
-                    f"smoke test expert FAILURE seed {int(r['seeds'][j[0]])}")
-      REPORT["render"]["failure_video"] = str(write_video(
-          utils.resolve_path("videos/smoke/expert_smoke_failure.mp4"), ff, 25))
+@report_section("render")
+def check_rendering(shared):
   import imageio.v2 as imageio
-  imageio.imwrite(out / "render_test.png", frames[len(frames) // 2])
-  REPORT["render"] = {**REPORT.get("render", {}), "png": str(out / "render_test.png"),
-                      "frame_mean_intensity": float(frames[0].mean())}
-  rend.close()
-  print(REPORT["render"])
+  from hw2.render import TrajectoryRenderer, add_caption, save_video
+  batched_env = shared["batched_env"]
+  out_dir = utils.repo_path("results/smoke")
+  out_dir.mkdir(parents=True, exist_ok=True)
+  renderer = TrajectoryRenderer(batched_env.mj_model, height=240, width=320)
+  results = shared.get("expert_results")
+  render_report = {}
+  if results is None:   # expert check was skipped: just render the first state
+    env_state = batched_env.to_numpy(batched_env.reset(np.arange(shared["batch_size"])))
+    frames = renderer.render_frames(env_state["qpos"][:1], env_state["target_pos"][0])
+  else:
+    i = int(np.argmax(results["success"])) if results["success"].any() else 0
+    frames = add_caption(renderer.render_frames(results["qpos"][i], results["target_pos"][i], every_nth=2),
+                         f"smoke test expert seed {int(results['seeds'][i])}")
+    render_report["video"] = str(save_video(utils.repo_path("videos/smoke/expert_smoke.mp4"), frames, 25))
+    failed_ids = np.flatnonzero(~results["success"])
+    if len(failed_ids):
+      j = failed_ids[0]
+      failure_frames = add_caption(renderer.render_frames(results["qpos"][j], results["target_pos"][j], every_nth=2),
+                                   f"smoke test expert FAILURE seed {int(results['seeds'][j])}")
+      render_report["failure_video"] = str(save_video(
+          utils.repo_path("videos/smoke/expert_smoke_failure.mp4"), failure_frames, 25))
+  imageio.imwrite(out_dir / "render_test.png", frames[len(frames) // 2])
+  render_report.update({"png": str(out_dir / "render_test.png"),
+                        "frame_mean_intensity": float(frames[0].mean())})   # ~0 would mean a black image
+  REPORT["render"] = render_report
+  renderer.close()
+  print(render_report)
 
 
-@section("torch")
-def check_torch(ctx):
+@report_section("torch")
+def check_training_speed(shared):
   import torch
   from hw2.policy import DiffusionPolicy
-  cfg = utils.load_config("configs/dp_base.yaml")
-  pc, tc = cfg["policy"], cfg["train"]
+  config = utils.load_config("configs/dp_base.yaml")
+  policy_config, train_config = config["policy"], config["train"]
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   obs_dim = REPORT.get("env", {}).get("obs_dim", 66)
-  policy = DiffusionPolicy(obs_dim=obs_dim, act_dim=8, **pc).to(device)
-  opt = torch.optim.AdamW(policy.parameters(), lr=1e-4)
-  B = tc["batch_size"]
-  nobs = torch.rand(B, pc["obs_horizon"], obs_dim, device=device) * 2 - 1
-  nact = torch.rand(B, pc["pred_horizon"], 8, device=device) * 2 - 1
+  policy = DiffusionPolicy(obs_dim=obs_dim, action_dim=8, **policy_config).to(device)
+  optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
+  batch_size = train_config["batch_size"]
+  fake_obs = torch.rand(batch_size, policy_config["obs_horizon"], obs_dim, device=device) * 2 - 1
+  fake_actions = torch.rand(batch_size, policy_config["pred_horizon"], 8, device=device) * 2 - 1
 
-  def train_steps(n):
-    for _ in range(n):
-      loss = policy.compute_loss(nobs, nact)
-      opt.zero_grad()
-      loss.backward()
-      opt.step()
+  def wait_for_gpu():
     if device.type == "cuda":
       torch.cuda.synchronize()
 
-  train_steps(5)
-  t0 = time.time()
-  train_steps(50)
-  sec_per_step = (time.time() - t0) / 50
+  def do_training_steps(num_steps):
+    for _ in range(num_steps):
+      loss = policy.compute_loss(fake_obs, fake_actions)
+      optimizer.zero_grad()
+      loss.backward()
+      optimizer.step()
+    wait_for_gpu()
+
+  do_training_steps(5)   # warm up
+  start_time = time.time()
+  do_training_steps(50)
+  seconds_per_step = (time.time() - start_time) / 50
+
   policy.eval()
-  obs = torch.rand(cfg["eval"]["batch_size"], pc["obs_horizon"], obs_dim, device=device)
-  policy.predict_action(obs)
-  if device.type == "cuda":
-    torch.cuda.synchronize()
-  t0 = time.time()
-  policy.predict_action(obs)
-  if device.type == "cuda":
-    torch.cuda.synchronize()
-  infer = time.time() - t0
-  n_chunks = int(np.ceil(150 / pc["action_horizon"]))
+  eval_obs = torch.rand(config["eval"]["batch_size"], policy_config["obs_horizon"], obs_dim, device=device)
+  policy.predict_action_sequence(eval_obs)   # warm up
+  wait_for_gpu()
+  start_time = time.time()
+  policy.predict_action_sequence(eval_obs)
+  wait_for_gpu()
+  seconds_per_sample = time.time() - start_time
+  policy_calls_per_episode = int(np.ceil(150 / policy_config["action_horizon"]))
+  num_eval_batches = config["eval"]["num_episodes"] / config["eval"]["batch_size"]
   REPORT["torch"] = {
       "device": str(device), "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
-      "params_M": round(sum(p.numel() for p in policy.parameters()) / 1e6, 2),
-      "train_s_per_step": round(sec_per_step, 4),
-      "est_train_min_per_run": round(sec_per_step * tc["num_steps"] / 60, 1),
-      "infer_s_per_chunk_batch": round(infer, 3),
-      "est_eval_policy_min": round(infer * n_chunks * cfg["eval"]["num_episodes"] / cfg["eval"]["batch_size"] / 60, 2),
+      "params_M": round(sum(param.numel() for param in policy.parameters()) / 1e6, 2),
+      "train_s_per_step": round(seconds_per_step, 4),
+      "est_train_min_per_run": round(seconds_per_step * train_config["num_steps"] / 60, 1),
+      "infer_s_per_chunk_batch": round(seconds_per_sample, 3),
+      "est_eval_policy_min": round(seconds_per_sample * policy_calls_per_episode * num_eval_batches / 60, 2),
       "peak_mem_GB": round(torch.cuda.max_memory_allocated() / 1e9, 2) if device.type == "cuda" else None,
   }
   print(REPORT["torch"])
@@ -209,20 +218,20 @@ def check_torch(ctx):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("--sections", nargs="*", default=["env", "expert", "render", "torch"])
-  parser.add_argument("--batch", type=int, default=50, help="envs in parallel (match collect.yaml)")
+  parser.add_argument("--checks", nargs="*", default=["env", "expert", "render", "torch"])
+  parser.add_argument("--batch", type=int, default=50, help="episodes in parallel (same as collect.yaml)")
   parser.add_argument("--set", dest="overrides", nargs="*", default=[], metavar="KEY=VALUE",
-                      help="overrides for configs/collect.yaml (expert tuning)")
+                      help="changes to configs/collect.yaml (for tuning the expert)")
   args = parser.parse_args()
-  ctx = {"batch": args.batch}
-  if {"env", "expert", "render"} & set(args.sections):
-    check_env(ctx)
-  if "expert" in args.sections and "benv" in ctx:
-    check_expert(ctx, args.overrides)
-  if "render" in args.sections and "benv" in ctx:
-    check_render(ctx)
-  if "torch" in args.sections:
-    check_torch(ctx)
+  shared = {"batch_size": args.batch}
+  if {"env", "expert", "render"} & set(args.checks):
+    check_environment(shared)
+  if "expert" in args.checks and "batched_env" in shared:
+    check_expert(shared, args.overrides)
+  if "render" in args.checks and "batched_env" in shared:
+    check_rendering(shared)
+  if "torch" in args.checks:
+    check_training_speed(shared)
   print("\n==== SMOKE TEST REPORT (paste this back) ====")
   print(json.dumps(REPORT, indent=1, default=str))
 

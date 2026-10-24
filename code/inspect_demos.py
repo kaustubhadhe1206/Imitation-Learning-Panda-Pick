@@ -1,13 +1,13 @@
-"""Visualize and summarize a demonstration dataset (Part 1 of the homework).
+"""Look at the demonstration dataset: statistics, figures and videos (Part 1).
 
-Outputs (default for the baseline dataset):
-  results/demos/demo_stats.json        counts, length / time-to-success stats
-  results/demos/fig_coverage.png       initial box / target positions
-  results/demos/fig_trajectories.png   gripper paths and box-target distance
-  results/demos/fig_actions.png        per-dimension action traces
-  results/demos/fig_phases.png         expert phase durations
-  results/demos/fig_frames.png         film strip of several demos (rendered)
-  videos/expert/*.mp4                  individual demos + a 2x2 grid
+Outputs (for the baseline dataset):
+  results/demos/demo_stats.json        counts, episode length, time-to-success
+  results/demos/fig_coverage.png       where the box and target start
+  results/demos/fig_trajectories.png   gripper paths and box-to-target distance
+  results/demos/fig_actions.png        expert actions for each joint
+  results/demos/fig_phases.png         time spent in each expert phase
+  results/demos/fig_frames.png         frames from several demos
+  videos/expert/*.mp4                  single demos and a 2x2 grid
 
 Usage:
   python code/inspect_demos.py [--data data/demos_baseline.npz] [--no-render]
@@ -20,186 +20,193 @@ import numpy as np
 
 import hw2  # noqa: F401
 from hw2 import plotting, utils
-from hw2.rollout import FAILURE_MODES, classify_failures
+from hw2.rollout import FAILURE_MODES, label_failure_modes
 
-PHASES = ["approach", "descend", "grasp", "lift", "transport"]
-
-
-def settle_step(success_step):
-  """First step after which the box stays within threshold until the end (-1 if never)."""
-  T1 = success_step.shape[1]
-  out = np.full(len(success_step), -1)
-  for i, s in enumerate(success_step):
-    if s[-1]:
-      bad = np.flatnonzero(~s)
-      out[i] = bad[-1] + 1 if len(bad) else 0
-  return np.minimum(out, T1 - 1)
+PHASE_NAMES = ["approach", "descend", "grasp", "lift", "transport"]
+VIDEO_FPS = 25          # we keep every 2nd state of a 50 Hz episode, so 25 fps is real time
+CONTROL_DT = 0.02       # seconds per env step
 
 
-def compute_stats(d):
-  succ = d["success"]
-  N, T = d["actions"].shape[:2]
-  path_len = np.linalg.norm(np.diff(d["grip_pos"], axis=1), axis=-1).sum(axis=1)
-  settle = settle_step(d["success_step"])
-  first = d["first_success_step"]
-  modes = classify_failures(d)
-  meta = json.loads(str(d["meta"]))
+def find_settle_steps(success_at_step):
+  """First step after which the box stays at the target until the end (-1 if it never settles)."""
+  num_positions = success_at_step.shape[1]
+  settle_steps = np.full(len(success_at_step), -1)
+  for i, success_flags in enumerate(success_at_step):
+    if success_flags[-1]:
+      not_at_target = np.flatnonzero(~success_flags)
+      settle_steps[i] = not_at_target[-1] + 1 if len(not_at_target) else 0
+  return np.minimum(settle_steps, num_positions - 1)
 
-  def ms(x):
-    return {"mean": float(np.mean(x)), "std": float(np.std(x)), "min": float(np.min(x)),
-            "max": float(np.max(x))} if len(x) else None
 
+def compute_dataset_stats(demos):
+  successful = demos["success"]
+  num_episodes, num_steps = demos["actions"].shape[:2]
+  gripper_path_length = np.linalg.norm(np.diff(demos["grip_pos"], axis=1), axis=-1).sum(axis=1)
+  settle_steps = find_settle_steps(demos["success_step"])
+  failure_modes = label_failure_modes(demos)
+  collection_info = json.loads(str(demos["meta"]))
+
+  def mean_std_min_max(values):
+    if not len(values):
+      return None
+    return {"mean": float(np.mean(values)), "std": float(np.std(values)),
+            "min": float(np.min(values)), "max": float(np.max(values))}
+
+  successful_actions = demos["actions"][successful]
   return {
-      "num_trajectories": int(N),
-      "num_successful": int(succ.sum()),
-      "success_fraction": float(succ.mean()),
-      "episode_length_steps": ms(np.full(N, T)),
-      "first_success_step_successful": ms(first[succ]),
-      "settle_step_successful": ms(settle[succ]),
-      "gripper_path_length_m_successful": ms(path_len[succ]),
-      "final_dist_m_successful": ms(d["dist"][succ, -1]),
-      "failure_modes": {m: int((modes == m).sum()) for m in FAILURE_MODES if (modes == m).any()},
-      "box_init_range": {"min": d["box_init"].min(0).tolist(), "max": d["box_init"].max(0).tolist()},
-      "target_range": {"min": d["target_pos"].min(0).tolist(), "max": d["target_pos"].max(0).tolist()},
-      "action_abs_mean_per_dim": np.abs(d["actions"][succ]).mean(axis=(0, 1)).tolist(),
-      "action_saturation_fraction": float((np.abs(d["actions"][succ]) > 0.999).mean()),
-      "ctrl_dt": 0.02,
-      "teacher": {k: meta.get(k) for k in ["name", "noise_std", "teacher_success_rate"]},
+      "num_trajectories": int(num_episodes),
+      "num_successful": int(successful.sum()),
+      "success_fraction": float(successful.mean()),
+      "episode_length_steps": mean_std_min_max(np.full(num_episodes, num_steps)),
+      "first_success_step_successful": mean_std_min_max(demos["first_success_step"][successful]),
+      "settle_step_successful": mean_std_min_max(settle_steps[successful]),
+      "gripper_path_length_m_successful": mean_std_min_max(gripper_path_length[successful]),
+      "final_dist_m_successful": mean_std_min_max(demos["dist"][successful, -1]),
+      "failure_modes": {mode: int((failure_modes == mode).sum())
+                        for mode in FAILURE_MODES if (failure_modes == mode).any()},
+      "box_init_range": {"min": demos["box_init"].min(0).tolist(), "max": demos["box_init"].max(0).tolist()},
+      "target_range": {"min": demos["target_pos"].min(0).tolist(), "max": demos["target_pos"].max(0).tolist()},
+      "action_abs_mean_per_dim": np.abs(successful_actions).mean(axis=(0, 1)).tolist(),
+      "action_saturation_fraction": float((np.abs(successful_actions) > 0.999).mean()),
+      "ctrl_dt": CONTROL_DT,
+      "teacher": {key: collection_info.get(key) for key in ["name", "noise_std", "teacher_success_rate"]},
   }
 
 
-def fig_coverage(d, path):
+def plot_initial_conditions(demos, path):
   plt = plotting.plt
-  succ = d["success"]
-  fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
-  ax = axes[0]
-  for mask, label, marker, color in [(succ, "success", "o", plotting.SERIES[0]),
-                                     (~succ, "failure", "x", plotting.SERIES[1])]:
+  successful = demos["success"]
+  fig, (ax_top, ax_height) = plt.subplots(1, 2, figsize=(10, 4.2))
+  for mask, label, marker, color in [(successful, "success", "o", plotting.COLORS[0]),
+                                     (~successful, "failure", "x", plotting.COLORS[1])]:
     if mask.any():
-      ax.scatter(d["box_init"][mask, 0], d["box_init"][mask, 1], s=22, marker=marker,
-                 color=color, label=f"box start ({label})")
-  ax.scatter(d["target_pos"][:, 0], d["target_pos"][:, 1], s=22, marker="^",
-             facecolors="none", edgecolors=plotting.SERIES[2], label="target")
-  ax.set(xlabel="x [m]", ylabel="y [m]", title="Initial conditions (top-down)", aspect="equal")
-  ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=8)
-  ax = axes[1]
-  ax.hist(d["target_pos"][:, 2], bins=15, color=plotting.SERIES[2], edgecolor="white", linewidth=1)
-  ax.set(xlabel="target height z [m]", ylabel="episodes", title="Target height distribution")
+      ax_top.scatter(demos["box_init"][mask, 0], demos["box_init"][mask, 1], s=22, marker=marker,
+                     color=color, label=f"box start ({label})")
+  ax_top.scatter(demos["target_pos"][:, 0], demos["target_pos"][:, 1], s=22, marker="^",
+                 facecolors="none", edgecolors=plotting.COLORS[2], label="target")
+  ax_top.set(xlabel="x [m]", ylabel="y [m]", title="Initial conditions (top-down)", aspect="equal")
+  ax_top.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=8)
+  ax_height.hist(demos["target_pos"][:, 2], bins=15, color=plotting.COLORS[2], edgecolor="white", linewidth=1)
+  ax_height.set(xlabel="target height z [m]", ylabel="episodes", title="Target height distribution")
   fig.tight_layout()
-  return plotting.save(fig, path)
+  return plotting.save_figure(fig, path)
 
 
-def fig_trajectories(d, path, n_show=20):
+def plot_trajectories(demos, path, num_to_show=20):
   plt = plotting.plt
-  succ_idx = np.flatnonzero(d["success"])[:n_show]
-  fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-  for i in succ_idx:
-    g = d["grip_pos"][i]
-    axes[0].plot(g[:, 0], g[:, 1], lw=1, color=plotting.SERIES[0], alpha=0.5)
-    axes[1].plot(g[:, 0], g[:, 2], lw=1, color=plotting.SERIES[0], alpha=0.5)
-  axes[0].scatter(d["box_init"][succ_idx, 0], d["box_init"][succ_idx, 1], s=12, color=plotting.TEXT_2, label="box start")
-  axes[0].scatter(d["target_pos"][succ_idx, 0], d["target_pos"][succ_idx, 1], s=14, marker="^",
-                  color=plotting.SERIES[2], label="target")
-  axes[0].set(xlabel="x [m]", ylabel="y [m]", title=f"Gripper paths, top-down ({len(succ_idx)} demos)")
-  axes[0].legend(fontsize=8)
-  axes[1].set(xlabel="x [m]", ylabel="z [m]", title="Gripper paths, side view")
-  t = np.arange(d["dist"].shape[1]) * 0.02
-  dist = d["dist"][d["success"]]
-  med, lo, hi = np.median(dist, 0), np.percentile(dist, 10, 0), np.percentile(dist, 90, 0)
-  axes[2].fill_between(t, lo, hi, color=plotting.SERIES[0], alpha=0.2, linewidth=0, label="10-90th pct")
-  axes[2].plot(t, med, color=plotting.SERIES[0], label="median")
-  axes[2].axhline(0.05, color=plotting.NEUTRAL, ls="--", lw=1.2, label="success threshold")
-  axes[2].set(xlabel="time [s]", ylabel="box-target distance [m]",
-              title=f"Box-target distance (successful demos, n={len(dist)})")
-  axes[2].legend(fontsize=8)
+  shown = np.flatnonzero(demos["success"])[:num_to_show]
+  fig, (ax_top, ax_side, ax_dist) = plt.subplots(1, 3, figsize=(14, 4))
+  for i in shown:
+    gripper_path = demos["grip_pos"][i]
+    ax_top.plot(gripper_path[:, 0], gripper_path[:, 1], lw=1, color=plotting.COLORS[0], alpha=0.5)
+    ax_side.plot(gripper_path[:, 0], gripper_path[:, 2], lw=1, color=plotting.COLORS[0], alpha=0.5)
+  ax_top.scatter(demos["box_init"][shown, 0], demos["box_init"][shown, 1], s=12,
+                 color=plotting.SECONDARY_TEXT_COLOR, label="box start")
+  ax_top.scatter(demos["target_pos"][shown, 0], demos["target_pos"][shown, 1], s=14, marker="^",
+                 color=plotting.COLORS[2], label="target")
+  ax_top.set(xlabel="x [m]", ylabel="y [m]", title=f"Gripper paths, top-down ({len(shown)} demos)")
+  ax_top.legend(fontsize=8)
+  ax_side.set(xlabel="x [m]", ylabel="z [m]", title="Gripper paths, side view")
+
+  time_s = np.arange(demos["dist"].shape[1]) * CONTROL_DT
+  distances = demos["dist"][demos["success"]]
+  median = np.median(distances, 0)
+  low, high = np.percentile(distances, 10, 0), np.percentile(distances, 90, 0)
+  ax_dist.fill_between(time_s, low, high, color=plotting.COLORS[0], alpha=0.2, linewidth=0, label="10-90th pct")
+  ax_dist.plot(time_s, median, color=plotting.COLORS[0], label="median")
+  ax_dist.axhline(0.05, color=plotting.REFERENCE_COLOR, ls="--", lw=1.2, label="success threshold")
+  ax_dist.set(xlabel="time [s]", ylabel="box-target distance [m]",
+              title=f"Box-target distance (successful demos, n={len(distances)})")
+  ax_dist.legend(fontsize=8)
   fig.tight_layout()
-  return plotting.save(fig, path)
+  return plotting.save_figure(fig, path)
 
 
-def fig_actions(d, path, n_show=10):
+def plot_actions(demos, path, num_to_show=10):
   plt = plotting.plt
-  idx = np.flatnonzero(d["success"])[:n_show]
-  t = np.arange(d["actions"].shape[1]) * 0.02
-  names = [f"joint {j + 1}" for j in range(7)] + ["gripper"]
+  shown = np.flatnonzero(demos["success"])[:num_to_show]
+  time_s = np.arange(demos["actions"].shape[1]) * CONTROL_DT
+  dimension_names = [f"joint {j + 1}" for j in range(7)] + ["gripper"]
   fig, axes = plt.subplots(2, 4, figsize=(14, 5.5), sharex=True, sharey=True)
-  for j, ax in enumerate(axes.flat):
-    for i in idx:
-      ax.plot(t, d["actions"][i, :, j], lw=1, color=plotting.SERIES[0], alpha=0.45)
-    ax.set_title(names[j])
+  for dim, ax in enumerate(axes.flat):
+    for i in shown:
+      ax.plot(time_s, demos["actions"][i, :, dim], lw=1, color=plotting.COLORS[0], alpha=0.45)
+    ax.set_title(dimension_names[dim])
     ax.set_ylim(-1.05, 1.05)
   for ax in axes[1]:
     ax.set_xlabel("time [s]")
   for ax in axes[:, 0]:
     ax.set_ylabel("action")
-  fig.suptitle(f"Expert actions for {len(idx)} successful demos (normalized delta joint targets)")
+  fig.suptitle(f"Expert actions for {len(shown)} successful demos (normalized changes of joint targets)")
   fig.tight_layout()
-  return plotting.save(fig, path)
+  return plotting.save_figure(fig, path)
 
 
-def fig_phases(d, path):
+def plot_phase_durations(demos, path):
   plt = plotting.plt
-  succ = d["success"]
-  dur = [(d["phase"][succ] == p).sum(axis=1) for p in range(len(PHASES))]
+  successful = demos["success"]
+  steps_per_phase = [(demos["phase"][successful] == phase).sum(axis=1) for phase in range(len(PHASE_NAMES))]
   fig, ax = plt.subplots(figsize=(7, 3.6))
-  bp = ax.boxplot(dur, tick_labels=PHASES, patch_artist=True, widths=0.5)
-  for box in bp["boxes"]:
-    box.set(facecolor=plotting.SERIES[0], alpha=0.35, edgecolor=plotting.SERIES[0])
-  for med in bp["medians"]:
-    med.set(color=plotting.TEXT, linewidth=1.5)
+  boxes = ax.boxplot(steps_per_phase, tick_labels=PHASE_NAMES, patch_artist=True, widths=0.5)
+  for box in boxes["boxes"]:
+    box.set(facecolor=plotting.COLORS[0], alpha=0.35, edgecolor=plotting.COLORS[0])
+  for median_line in boxes["medians"]:
+    median_line.set(color=plotting.TEXT_COLOR, linewidth=1.5)
   ax.set(ylabel="steps (x 0.02 s)", title="Time spent in each expert phase (successful demos)")
   fig.tight_layout()
-  return plotting.save(fig, path)
+  return plotting.save_figure(fig, path)
 
 
-def render_outputs(d, out_dir, video_dir, num_videos):
-  from hw2.envs import load_env
-  from hw2.render import TrajectoryRenderer, annotate, tile, write_video
+def render_videos_and_frames(demos, out_dir, video_dir, num_videos):
+  from hw2.envs import load_pick_cube_env
+  from hw2.render import TrajectoryRenderer, add_caption, save_video, tile_videos
   plt = plotting.plt
 
-  env = load_env()
-  fps = 25  # every 2nd state of a 50 Hz rollout -> real time
+  env = load_pick_cube_env()
+  successful_ids = np.flatnonzero(demos["success"])
+  failed_ids = np.flatnonzero(~demos["success"])
+  saved_videos = []
+
   renderer = TrajectoryRenderer(env.mj_model, height=480, width=640)
-  succ_idx = np.flatnonzero(d["success"])
-  fail_idx = np.flatnonzero(~d["success"])
-  written = []
-  for i in succ_idx[:num_videos]:
-    frames = renderer.render(d["qpos"][i], d["target_pos"][i], every=2)
-    frames = annotate(frames, f"expert demo seed {d['seeds'][i]} - success")
-    written.append(str(write_video(video_dir / f"expert_demo_seed{d['seeds'][i]}.mp4", frames, fps)))
-  for i in fail_idx[:1]:
-    frames = renderer.render(d["qpos"][i], d["target_pos"][i], every=2)
-    frames = annotate(frames, f"expert seed {d['seeds'][i]} - FAILURE")
-    written.append(str(write_video(video_dir / f"expert_failure_seed{d['seeds'][i]}.mp4", frames, fps)))
+  for i in successful_ids[:num_videos]:
+    frames = renderer.render_frames(demos["qpos"][i], demos["target_pos"][i], every_nth=2)
+    frames = add_caption(frames, f"expert demo seed {demos['seeds'][i]} - success")
+    saved_videos.append(str(save_video(video_dir / f"expert_demo_seed{demos['seeds'][i]}.mp4", frames, VIDEO_FPS)))
+  for i in failed_ids[:1]:
+    frames = renderer.render_frames(demos["qpos"][i], demos["target_pos"][i], every_nth=2)
+    frames = add_caption(frames, f"expert seed {demos['seeds'][i]} - FAILURE")
+    saved_videos.append(str(save_video(video_dir / f"expert_failure_seed{demos['seeds'][i]}.mp4", frames, VIDEO_FPS)))
   renderer.close()
 
-  small = TrajectoryRenderer(env.mj_model, height=240, width=320)
-  grid = [annotate(small.render(d["qpos"][i], d["target_pos"][i], every=2), f"seed {d['seeds'][i]}")
-          for i in succ_idx[:4]]
-  written.append(str(write_video(video_dir / "expert_demos_grid.mp4", tile(grid, 2), fps)))
+  small_renderer = TrajectoryRenderer(env.mj_model, height=240, width=320)
+  grid_videos = [add_caption(small_renderer.render_frames(demos["qpos"][i], demos["target_pos"][i], every_nth=2),
+                             f"seed {demos['seeds'][i]}")
+                 for i in successful_ids[:4]]
+  saved_videos.append(str(save_video(video_dir / "expert_demos_grid.mp4", tile_videos(grid_videos, 2), VIDEO_FPS)))
 
-  # Film strip: rows = demos, columns = time.
-  times = [0, 25, 50, 75, 100, 150]
-  rows = succ_idx[:4]
-  fig, axes = plt.subplots(len(rows), len(times), figsize=(2.2 * len(times), 1.75 * len(rows)))
-  for r, i in enumerate(rows):
-    frames = small.render(d["qpos"][i][times], d["target_pos"][i])
-    for c, (f, t) in enumerate(zip(frames, times)):
-      ax = axes[r, c]
-      ax.imshow(f)
+  # Film strip: one row per demo, one column per time.
+  frame_steps = [0, 25, 50, 75, 100, 150]
+  rows = successful_ids[:4]
+  fig, axes = plt.subplots(len(rows), len(frame_steps), figsize=(2.2 * len(frame_steps), 1.75 * len(rows)))
+  for row, i in enumerate(rows):
+    frames = small_renderer.render_frames(demos["qpos"][i][frame_steps], demos["target_pos"][i])
+    for col, (frame, step) in enumerate(zip(frames, frame_steps)):
+      ax = axes[row, col]
+      ax.imshow(frame)
       ax.set_xticks([])
       ax.set_yticks([])
       ax.grid(False)
-      for s in ax.spines.values():
-        s.set_visible(False)
-      if r == 0:
-        ax.set_title(f"t = {t * 0.02:.1f} s", fontsize=9)
-      if c == 0:
-        ax.set_ylabel(f"seed {d['seeds'][i]}", fontsize=9)
-  fig.suptitle("Expert demonstrations (red translucent box = target)", fontsize=11)
+      for spine in ax.spines.values():
+        spine.set_visible(False)
+      if row == 0:
+        ax.set_title(f"t = {step * CONTROL_DT:.1f} s", fontsize=9)
+      if col == 0:
+        ax.set_ylabel(f"seed {demos['seeds'][i]}", fontsize=9)
+  fig.suptitle("Expert demonstrations (red see-through box = target)", fontsize=11)
   fig.tight_layout()
-  plotting.save(fig, out_dir / "fig_frames.png")
-  small.close()
-  return written
+  plotting.save_figure(fig, out_dir / "fig_frames.png")
+  small_renderer.close()
+  return saved_videos
 
 
 def main():
@@ -211,27 +218,29 @@ def main():
   parser.add_argument("--no-render", action="store_true")
   args = parser.parse_args()
 
-  plotting.setup()
-  out_dir = utils.resolve_path(args.out)
-  with np.load(utils.resolve_path(args.data)) as z:
-    d = {k: z[k] for k in z.files}
+  plotting.use_report_style()
+  out_dir = utils.repo_path(args.out)
+  with np.load(utils.repo_path(args.data)) as saved:
+    demos = {name: saved[name] for name in saved.files}
 
-  stats = compute_stats(d)
+  stats = compute_dataset_stats(demos)
   utils.save_json(stats, out_dir / "demo_stats.json")
-  fig_coverage(d, out_dir / "fig_coverage.png")
-  fig_trajectories(d, out_dir / "fig_trajectories.png")
-  fig_actions(d, out_dir / "fig_actions.png")
-  fig_phases(d, out_dir / "fig_phases.png")
-  videos = [] if args.no_render else render_outputs(d, out_dir, utils.resolve_path(args.video_dir), args.num_videos)
+  plot_initial_conditions(demos, out_dir / "fig_coverage.png")
+  plot_trajectories(demos, out_dir / "fig_trajectories.png")
+  plot_actions(demos, out_dir / "fig_actions.png")
+  plot_phase_durations(demos, out_dir / "fig_phases.png")
+  videos = []
+  if not args.no_render:
+    videos = render_videos_and_frames(demos, out_dir, utils.repo_path(args.video_dir), args.num_videos)
 
   print("\n==== DEMO STATS (paste this back) ====")
-  print(json.dumps({k: stats[k] for k in [
+  print(json.dumps({key: stats[key] for key in [
       "num_trajectories", "num_successful", "success_fraction", "episode_length_steps",
       "first_success_step_successful", "settle_step_successful", "gripper_path_length_m_successful",
       "final_dist_m_successful", "failure_modes", "action_saturation_fraction"]}, indent=2))
   print("figures ->", out_dir)
-  for v in videos:
-    print("video ->", v)
+  for video in videos:
+    print("video ->", video)
 
 
 if __name__ == "__main__":

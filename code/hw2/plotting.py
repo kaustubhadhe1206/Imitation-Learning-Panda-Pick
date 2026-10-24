@@ -1,32 +1,32 @@
-"""Shared matplotlib style for report figures (light theme, print-friendly)."""
+"""Common matplotlib style for all report figures."""
 
 import matplotlib
 
-matplotlib.use("Agg")
+matplotlib.use("Agg")   # no screen needed (Colab / cluster)
 import matplotlib.pyplot as plt  # noqa: E402
 
-# Categorical slots in fixed order (colorblind-validated order; never cycled).
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
-TEXT = "#0b0b0b"
-TEXT_2 = "#52514e"
-GRID = "#e4e3df"
-NEUTRAL = "#8a8985"   # reference lines (e.g. teacher), not a data series
+# Line/bar colors, always used in this order (this order is colorblind-friendly).
+COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+TEXT_COLOR = "#0b0b0b"
+SECONDARY_TEXT_COLOR = "#52514e"
+GRID_COLOR = "#e4e3df"
+REFERENCE_COLOR = "#8a8985"   # gray for reference lines like the teacher's success rate
 
 
-def setup():
+def use_report_style():
   plt.rcParams.update({
       "figure.dpi": 120, "savefig.dpi": 200, "savefig.bbox": "tight",
       "font.size": 10, "axes.titlesize": 11, "axes.labelsize": 10,
-      "axes.edgecolor": TEXT_2, "axes.labelcolor": TEXT, "axes.titlecolor": TEXT,
-      "xtick.color": TEXT_2, "ytick.color": TEXT_2,
+      "axes.edgecolor": SECONDARY_TEXT_COLOR, "axes.labelcolor": TEXT_COLOR, "axes.titlecolor": TEXT_COLOR,
+      "xtick.color": SECONDARY_TEXT_COLOR, "ytick.color": SECONDARY_TEXT_COLOR,
       "axes.spines.top": False, "axes.spines.right": False,
-      "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8,
+      "axes.grid": True, "grid.color": GRID_COLOR, "grid.linewidth": 0.8,
       "axes.axisbelow": True, "lines.linewidth": 2.0, "lines.markersize": 6,
-      "legend.frameon": False, "axes.prop_cycle": matplotlib.cycler(color=SERIES),
+      "legend.frameon": False, "axes.prop_cycle": matplotlib.cycler(color=COLORS),
   })
 
 
-def save(fig, path):
+def save_figure(fig, path):
   from pathlib import Path
   path = Path(path)
   path.parent.mkdir(parents=True, exist_ok=True)

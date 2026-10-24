@@ -1,78 +1,80 @@
-"""Demonstration loading, normalization and sequence windows for Diffusion Policy.
+"""Loading demonstrations and cutting them into training windows for Diffusion Policy.
 
-Windowing follows Chi et al.'s state-based Diffusion Policy notebook: every
-training sample is a length-`pred_horizon` action sequence starting at time
-t, conditioned on the `obs_horizon` observations starting at t. Episodes are
-edge-padded (first frame repeated `obs_horizon - 1` times before the start,
-last frame repeated `action_horizon - 1` times after the end), which here is
-implemented as index clipping.
+The windowing is the same as in Chi et al.'s state-based Diffusion Policy
+notebook: each training sample is a sequence of `pred_horizon` actions starting
+at time t, together with the `obs_horizon` observations starting at t.
+At the start of an episode the first observation is repeated, and at the end
+the last action is repeated, so every step can be used. Here that padding is
+done by clipping the time indices to [0, episode_length - 1].
 """
 
 import numpy as np
 
 
-def load_demos(path, num_demos=None, success_only=True):
-  """Load demonstrations; subsets are the first `num_demos` successes by seed.
+def load_demonstrations(path, num_demos=None, only_successful=True):
+  """Load demos from an .npz file. With num_demos=N we take the first N successful demos by seed.
 
-  Taking a prefix in seed order makes the 25-demo set a subset of the
-  50-demo set, which is a subset of the 100-demo set.
+  Because we always take the first N in seed order, the 25-demo set is part of
+  the 50-demo set, which is part of the 100-demo set.
   """
-  with np.load(path) as z:
-    idx = np.flatnonzero(z["success"]) if success_only else np.arange(len(z["seeds"]))
-    idx = idx[np.argsort(z["seeds"][idx], kind="stable")]
+  with np.load(path) as saved:
+    if only_successful:
+      episode_ids = np.flatnonzero(saved["success"])
+    else:
+      episode_ids = np.arange(len(saved["seeds"]))
+    episode_ids = episode_ids[np.argsort(saved["seeds"][episode_ids], kind="stable")]
     if num_demos is not None:
-      if len(idx) < num_demos:
-        raise ValueError(f"Requested {num_demos} demos but {path} has only {len(idx)}")
-      idx = idx[:num_demos]
+      if len(episode_ids) < num_demos:
+        raise ValueError(f"Asked for {num_demos} demos but {path} only has {len(episode_ids)}")
+      episode_ids = episode_ids[:num_demos]
     return {
-        "obs": z["obs"][idx].astype(np.float32),
-        "actions": z["actions"][idx].astype(np.float32),
-        "seeds": z["seeds"][idx],
+        "obs": saved["obs"][episode_ids].astype(np.float32),
+        "actions": saved["actions"][episode_ids].astype(np.float32),
+        "seeds": saved["seeds"][episode_ids],
     }
 
 
 class MinMaxNormalizer:
-  """Per-dimension affine map of the data range to [-1, 1]."""
+  """Scales every dimension so that its min..max range becomes -1..1."""
 
   def __init__(self, data_min, data_max, eps=1e-4):
     self.min = np.asarray(data_min, dtype=np.float32)
     self.max = np.asarray(data_max, dtype=np.float32)
-    rng = self.max - self.min
-    # Near-constant dimensions: map to ~0 instead of dividing by ~0.
-    self.scale = np.where(rng > eps, 2.0 / np.maximum(rng, eps), 1.0).astype(np.float32)
-    self.offset = np.where(rng > eps, -1.0 - self.min * self.scale, -self.min).astype(np.float32)
+    data_range = self.max - self.min
+    # Dimensions that (almost) never change would divide by ~0, so map them to 0 instead.
+    changes = data_range > eps
+    self.scale = np.where(changes, 2.0 / np.maximum(data_range, eps), 1.0).astype(np.float32)
+    self.offset = np.where(changes, -1.0 - self.min * self.scale, -self.min).astype(np.float32)
 
   @classmethod
-  def fit(cls, x):
-    x = x.reshape(-1, x.shape[-1])
-    return cls(x.min(axis=0), x.max(axis=0))
+  def fit(cls, data):
+    flat = data.reshape(-1, data.shape[-1])
+    return cls(flat.min(axis=0), flat.max(axis=0))
 
-  def normalize(self, x):
-    return x * self.scale + self.offset
+  def normalize(self, data):
+    return data * self.scale + self.offset
 
-  def unnormalize(self, y):
-    return (y - self.offset) / self.scale
-
-  def state(self):
-    return {"min": self.min, "max": self.max}
+  def unnormalize(self, normalized):
+    return (normalized - self.offset) / self.scale
 
 
-def window_indices(length, obs_horizon, pred_horizon, action_horizon):
-  """(num_windows, pred_horizon) time indices into one episode, edge-clipped."""
-  starts = np.arange(-(obs_horizon - 1), length - pred_horizon + action_horizon)
-  idx = starts[:, None] + np.arange(pred_horizon)[None, :]
-  return np.clip(idx, 0, length - 1)
+def get_window_time_indices(episode_length, obs_horizon, pred_horizon, action_horizon):
+  """Time indices of every training window in one episode, shape (num_windows, pred_horizon)."""
+  window_starts = np.arange(-(obs_horizon - 1), episode_length - pred_horizon + action_horizon)
+  time_indices = window_starts[:, None] + np.arange(pred_horizon)[None, :]
+  return np.clip(time_indices, 0, episode_length - 1)
 
 
-def make_windows(obs, actions, obs_horizon, pred_horizon, action_horizon):
-  """Stack all windows of all episodes.
+def make_training_windows(obs, actions, obs_horizon, pred_horizon, action_horizon):
+  """Cut all episodes into windows.
 
-  obs: (N, T, obs_dim), actions: (N, T, act_dim) ->
-  obs windows (W, obs_horizon, obs_dim), action windows (W, pred_horizon, act_dim)
+  obs: (num_episodes, T, obs_dim), actions: (num_episodes, T, action_dim)
+  returns obs windows (num_windows, obs_horizon, obs_dim) and
+  action windows (num_windows, pred_horizon, action_dim)
   """
-  obs_w, act_w = [], []
-  for o, a in zip(obs, actions):
-    ix = window_indices(len(o), obs_horizon, pred_horizon, action_horizon)
-    obs_w.append(o[ix[:, :obs_horizon]])
-    act_w.append(a[ix])
-  return np.concatenate(obs_w), np.concatenate(act_w)
+  obs_windows, action_windows = [], []
+  for episode_obs, episode_actions in zip(obs, actions):
+    time_indices = get_window_time_indices(len(episode_obs), obs_horizon, pred_horizon, action_horizon)
+    obs_windows.append(episode_obs[time_indices[:, :obs_horizon]])
+    action_windows.append(episode_actions[time_indices])
+  return np.concatenate(obs_windows), np.concatenate(action_windows)

@@ -9,13 +9,13 @@ from pathlib import Path
 cells = []
 
 
-def md(s):
-  cells.append({"cell_type": "markdown", "metadata": {}, "source": s.strip("\n").splitlines(keepends=True)})
+def md(text):
+  cells.append({"cell_type": "markdown", "metadata": {}, "source": text.strip("\n").splitlines(keepends=True)})
 
 
-def code(s):
+def code(text):
   cells.append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
-                "source": s.strip("\n").splitlines(keepends=True)})
+                "source": text.strip("\n").splitlines(keepends=True)})
 
 
 md(r"""
@@ -72,22 +72,23 @@ else:
     os.environ.pop("HW2_PUSH_URL", None)               # run_sweep.py --push then skips pushing
 print("GitHub push:", "enabled" if CAN_PUSH else "disabled (outputs are kept on Drive only)")
 
-def git(*args, check=True):
-    r = subprocess.run(["git", *args], cwd=REPO if REPO.exists() else None, capture_output=True, text=True)
-    out = r.stdout + r.stderr
-    if TOKEN: out = out.replace(TOKEN, "***")
-    if out.strip(): print(out.strip())
-    if check and r.returncode: raise RuntimeError(f"git {args[0]} failed")
-    return r
+def run_git(*args, check=True):
+    # Run a git command and print its output (with the token hidden).
+    result = subprocess.run(["git", *args], cwd=REPO if REPO.exists() else None, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+    if TOKEN: output = output.replace(TOKEN, "***")
+    if output.strip(): print(output.strip())
+    if check and result.returncode: raise RuntimeError(f"git {args[0]} failed")
+    return result
 
 if not (REPO / ".git").exists():
-    git("clone", "-q", "-b", BRANCH, REPO_URL, str(REPO))
+    run_git("clone", "-q", "-b", BRANCH, REPO_URL, str(REPO))
 else:
-    git("pull", "--ff-only", REPO_URL, BRANCH)
+    run_git("pull", "--ff-only", REPO_URL, BRANCH)
 if CAN_PUSH:
-    git("config", "user.name", GIT_NAME); git("config", "user.email", GIT_EMAIL)
+    run_git("config", "user.name", GIT_NAME); run_git("config", "user.email", GIT_EMAIL)
 os.chdir(REPO)
-git("log", "--oneline", "-3")
+run_git("log", "--oneline", "-3")
 """)
 
 code(r"""
@@ -104,29 +105,30 @@ if IN_COLAB:
         from google.colab import drive
         drive.mount("/content/drive")
         STORAGE = pathlib.Path("/content/drive/MyDrive") / DRIVE_FOLDER
-    except Exception as e:
-        print("WARNING: Google Drive could not be mounted (" + repr(e)[:200] + ").\n"
+    except Exception as error:
+        print("WARNING: Google Drive could not be mounted (" + repr(error)[:200] + ").\n"
               "Outputs stay on the VM" + ("; results are still pushed to GitHub after each step." if CAN_PUSH
               else " and are LOST on disconnect. Re-run cell 1 with a GitHub token to push them."))
 if STORAGE is not None:
-    for sub in ["runs", "logs", "data", "results", "videos"]:
-        (STORAGE / sub).mkdir(parents=True, exist_ok=True)
-    runs = REPO / "runs"
-    if runs.exists() and not runs.is_symlink():          # move anything created before the mount
-        shutil.copytree(runs, STORAGE / "runs", dirs_exist_ok=True)
-        shutil.rmtree(runs)
-    if not runs.is_symlink():
-        runs.symlink_to(STORAGE / "runs", target_is_directory=True)
-    os.environ["HW2_MIRROR_DIR"] = str(STORAGE)           # run_sweep.py copies each finished run here
+    for folder in ["runs", "logs", "data", "results", "videos"]:
+        (STORAGE / folder).mkdir(parents=True, exist_ok=True)
+    runs_dir = REPO / "runs"
+    if runs_dir.exists() and not runs_dir.is_symlink():   # move anything made before Drive was mounted
+        shutil.copytree(runs_dir, STORAGE / "runs", dirs_exist_ok=True)
+        shutil.rmtree(runs_dir)
+    if not runs_dir.is_symlink():
+        runs_dir.symlink_to(STORAGE / "runs", target_is_directory=True)
+    os.environ["HW2_MIRROR_DIR"] = str(STORAGE)            # run_sweep.py copies each finished run here
     print("Drive storage:", STORAGE)
-    print("existing checkpoints:", sorted(p.parent.name for p in (STORAGE / "runs").glob("*/checkpoint.pt")))
+    saved_checkpoints = sorted(path.parent.name for path in (STORAGE / "runs").glob("*/checkpoint.pt"))
+    print("existing checkpoints:", saved_checkpoints)
 
-def save_to_drive():
-    # Copy data/, results/, videos/ from the repo into the Drive folder (no-op without Drive).
+def copy_outputs_to_drive():
+    # Copy data/, results/, videos/ from the repo into the Drive folder (does nothing without Drive).
     if STORAGE is None: return
-    for sub in ["data", "results", "videos"]:
-        if (REPO / sub).exists():
-            shutil.copytree(REPO / sub, STORAGE / sub, dirs_exist_ok=True)
+    for folder in ["data", "results", "videos"]:
+        if (REPO / folder).exists():
+            shutil.copytree(REPO / folder, STORAGE / folder, dirs_exist_ok=True)
     print("saved to Drive:", STORAGE)
 """)
 
@@ -135,40 +137,41 @@ code(r"""
 if IN_COLAB:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"], check=True)
     # EGL vendor file for headless MuJoCo rendering on Colab GPUs (as in the Playground notebooks).
-    icd = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
-    if not os.path.exists(icd):
-        os.makedirs(os.path.dirname(icd), exist_ok=True)
-        with open(icd, "w") as f:
+    egl_vendor_file = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+    if not os.path.exists(egl_vendor_file):
+        os.makedirs(os.path.dirname(egl_vendor_file), exist_ok=True)
+        with open(egl_vendor_file, "w") as f:
             f.write('{"file_format_version" : "1.0.0", "ICD" : {"library_path" : "libEGL_nvidia.so.0"}}')
 os.environ["MUJOCO_GL"] = "egl"
 subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv"])
 
-def sh(cmd):
-    # Run a pipeline command from the repo root, streaming its output (and logging it to Drive); raise on failure.
-    print("$", cmd, flush=True)
-    log = None
+def run_command(command):
+    # Run a pipeline command from the repo root, show its output live (and save it to a log on Drive).
+    print("$", command, flush=True)
+    log_file = None
     if STORAGE is not None:
-        name = "-".join(pathlib.Path(a).stem for a in shlex.split(cmd)[1:3])
-        log = open(STORAGE / "logs" / f"{datetime.datetime.now():%Y%m%d-%H%M%S}_{name}.log", "w")
-        log.write(f"$ {cmd}\n")
-    p = subprocess.Popen(shlex.split(cmd), cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in p.stdout:
+        script_name = "-".join(pathlib.Path(arg).stem for arg in shlex.split(command)[1:3])
+        log_file = open(STORAGE / "logs" / f"{datetime.datetime.now():%Y%m%d-%H%M%S}_{script_name}.log", "w")
+        log_file.write(f"$ {command}\n")
+    process = subprocess.Popen(shlex.split(command), cwd=REPO, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+    for line in process.stdout:
         print(line, end="")
-        if log: log.write(line); log.flush()
-    code = p.wait()
-    if log: log.close()
-    if code: raise RuntimeError(f"command failed ({code}): {cmd}")
+        if log_file: log_file.write(line); log_file.flush()
+    exit_code = process.wait()
+    if log_file: log_file.close()
+    if exit_code: raise RuntimeError(f"command failed ({exit_code}): {command}")
 
-def push(paths, message):
-    # Save outputs to Drive, then (if a token was given) commit the given paths and push to GitHub.
-    save_to_drive()
+def save_and_push(paths, message):
+    # Copy outputs to Drive, then (if a token was given) commit the given paths and push to GitHub.
+    copy_outputs_to_drive()
     if not CAN_PUSH: return print("GitHub push skipped (no token)")
-    paths = [p for p in paths if (REPO / p).exists()]
+    paths = [path for path in paths if (REPO / path).exists()]
     if not paths: return print("nothing to push")
-    git("add", "-f", *paths)
-    if git("diff", "--cached", "--quiet", check=False).returncode:
-        git("commit", "-q", "-m", message)
-        git("push", "-q", os.environ["HW2_PUSH_URL"], f"HEAD:{BRANCH}")
+    run_git("add", "-f", *paths)
+    if run_git("diff", "--cached", "--quiet", check=False).returncode:
+        run_git("commit", "-q", "-m", message)
+        run_git("push", "-q", os.environ["HW2_PUSH_URL"], f"HEAD:{BRANCH}")
         print("pushed:", message)
     else:
         print("nothing to commit")
@@ -181,17 +184,18 @@ md(r"""
 Versions, GPU, environment dimensions, expert success on 50 seeds, a rendered video and
 training-speed estimates. **Paste the final `SMOKE TEST REPORT` block back to Claude.**
 To tune the expert, re-run with overrides, e.g.
-`sh("python code/smoke_test.py --sections env expert render --set expert.v_approach=0.025")`.
+`run_command("python code/smoke_test.py --checks env expert render --set expert.approach_speed=0.025")`.
 """)
 
 code(r"""
-sh("python tests/test_cpu.py")
-sh("python code/smoke_test.py")
+run_command("python tests/test_cpu.py")
+run_command("python code/smoke_test.py")
 """)
 
 code(r"""
-for v in ["videos/smoke/expert_smoke.mp4", "videos/smoke/expert_smoke_failure.mp4"]:
-    if (REPO / v).exists(): display(Markdown(f"`{v}`"), Video(str(REPO / v), embed=True, width=480))
+for video_path in ["videos/smoke/expert_smoke.mp4", "videos/smoke/expert_smoke_failure.mp4"]:
+    if (REPO / video_path).exists():
+        display(Markdown(f"`{video_path}`"), Video(str(REPO / video_path), embed=True, width=480))
 """)
 
 md(r"""
@@ -202,14 +206,14 @@ Skipped automatically if `data/demos_baseline.npz` is already in the repo (set `
 code(r"""
 FORCE = False
 if FORCE or not (REPO / "data/demos_baseline.npz").exists():
-    sh("python code/collect_demos.py")
-sh("python code/inspect_demos.py")
-for f in ["fig_frames", "fig_coverage", "fig_trajectories", "fig_actions", "fig_phases"]:
-    p = REPO / f"results/demos/{f}.png"
-    if p.exists(): display(Image(str(p)))
-grid = REPO / "videos/expert/expert_demos_grid.mp4"
-if grid.exists(): display(Video(str(grid), embed=True, width=640))
-push(["data/demos_baseline.npz", "results/demos", "videos/expert"], "demos: baseline dataset + inspection")
+    run_command("python code/collect_demos.py")
+run_command("python code/inspect_demos.py")
+for figure_name in ["fig_frames", "fig_coverage", "fig_trajectories", "fig_actions", "fig_phases"]:
+    figure_path = REPO / f"results/demos/{figure_name}.png"
+    if figure_path.exists(): display(Image(str(figure_path)))
+grid_video = REPO / "videos/expert/expert_demos_grid.mp4"
+if grid_video.exists(): display(Video(str(grid_video), embed=True, width=640))
+save_and_push(["data/demos_baseline.npz", "results/demos", "videos/expert"], "demos: baseline dataset + inspection")
 """)
 
 md(r"""
@@ -218,8 +222,8 @@ md(r"""
 
 code(r"""
 if not (REPO / "results/teacher_eval/eval_summary.json").exists():
-    sh("python code/evaluate.py --teacher --out-dir results/teacher_eval --video-dir videos/teacher_eval")
-push(["results/teacher_eval", "videos/teacher_eval"], "results: teacher evaluation")
+    run_command("python code/evaluate.py --teacher --out-dir results/teacher_eval --video-dir videos/teacher_eval")
+save_and_push(["results/teacher_eval", "videos/teacher_eval"], "results: teacher evaluation")
 """)
 
 md(r"""
@@ -231,8 +235,8 @@ data -> training -> execution path is wired correctly. Not part of the reported 
 code(r"""
 RUN_SANITY = True
 if RUN_SANITY:
-    sh("python code/train.py --run-dir runs/sanity_n5 --set data.num_demos=5 train.num_steps=3000 eval.batch_size=5")
-    sh("python code/evaluate.py --run-dir runs/sanity_n5 --on-train-seeds --out-dir results/sanity_n5 --num-videos 1")
+    run_command("python code/train.py --run-dir runs/sanity_n5 --set data.num_demos=5 train.num_steps=3000 eval.batch_size=5")
+    run_command("python code/evaluate.py --run-dir runs/sanity_n5 --on-train-seeds --out-dir results/sanity_n5 --num-videos 1")
 """)
 
 md(r"""
@@ -245,8 +249,8 @@ continues from its last saved step.
 """)
 
 code(r"""
-sh("python code/run_sweep.py --dry-run")
-sh("python code/run_sweep.py --push")
+run_command("python code/run_sweep.py --dry-run")
+run_command("python code/run_sweep.py --push")
 """)
 
 md(r"""
@@ -254,28 +258,29 @@ md(r"""
 """)
 
 code(r"""
-sh("python code/analyze.py")
+run_command("python code/analyze.py")
 display(Markdown((REPO / "results/summary_table.md").read_text()))
-for f in ["fig_success_vs_demos", "fig_success_vs_threshold", "fig_failure_modes", "fig_loss_curves", "fig_smoothness"]:
-    display(Image(str(REPO / f"results/{f}.png")))
-push(["results", "videos"], "results: aggregate tables and figures")
+for figure_name in ["fig_success_vs_demos", "fig_success_vs_threshold", "fig_failure_modes",
+                    "fig_loss_curves", "fig_smoothness"]:
+    display(Image(str(REPO / f"results/{figure_name}.png")))
+save_and_push(["results", "videos"], "results: aggregate tables and figures")
 """)
 
 code(r"""
 # ---- Commit any code edits made on this runtime (review the diff first!) ---------------------
-git("status", "--short")
-# push(["code", "configs"], "code: edits made on the runtime")
+run_git("status", "--short")
+# save_and_push(["code", "configs"], "code: edits made on the runtime")
 """)
 
-nb = {
+notebook = {
     "cells": cells,
     "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                  "language_info": {"name": "python"}, "accelerator": "GPU", "colab": {"provenance": []}},
     "nbformat": 4, "nbformat_minor": 5,
 }
-for i, c in enumerate(nb["cells"]):
-  c["id"] = f"cell-{i:02d}"
-out = Path(__file__).with_name("run_pipeline.ipynb")
-with open(out, "w", newline="\n") as f:
-  json.dump(nb, f, indent=1)
-print(f"wrote {out} ({len(cells)} cells)")
+for index, cell in enumerate(notebook["cells"]):
+  cell["id"] = f"cell-{index:02d}"
+notebook_path = Path(__file__).with_name("run_pipeline.ipynb")
+with open(notebook_path, "w", newline="\n") as f:
+  json.dump(notebook, f, indent=1)
+print(f"wrote {notebook_path} ({len(cells)} cells)")

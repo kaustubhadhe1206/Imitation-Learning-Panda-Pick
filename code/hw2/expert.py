@@ -1,30 +1,33 @@
-"""Scripted pick-and-place expert for PandaPickCube.
+"""Scripted pick-and-place expert (the "teacher") for PandaPickCube.
 
-Action interface (MuJoCo Playground PandaPickCube): an 8-D action in [-1, 1]
-changes the actuator position targets, ctrl <- clip(ctrl + 0.04 * a). The
-first 7 actuators are joint position servos (kp = 1000/1000/750/750/300/300/300),
-the 8th drives the finger opening in [0, 0.04] m.
+How actions work in PandaPickCube: the action is 8 numbers in [-1, 1] and the
+env does ctrl = clip(ctrl + 0.04 * action). The first 7 ctrl values are target
+angles for the 7 arm joints (position servos), the 8th is the finger opening
+(0 = closed, 0.04 m = open).
 
-The expert is a phase state machine over a Cartesian waypoint for the gripper
-site (the point between the fingertips):
+The expert goes through these phases:
+  APPROACH   move above the box with the gripper open
+  DESCEND    go straight down until the gripper is around the box
+  GRASP      stay still and close the gripper
+  LIFT       lift the box straight up a bit
+  TRANSPORT  move so the box center is on the target, then hold it there
 
-  APPROACH   above the box (pregrasp_height), gripper open
-  DESCEND    down to the box centre, gripper open
-  GRASP      hold position while closing the gripper
-  LIFT       straight up by lift_height
-  TRANSPORT  move so that the box centre sits on the target, hold there
+Each phase has a waypoint for the gripper. Instead of jumping to the waypoint,
+a "reference point" moves toward it with a speed limit, so the motion is
+smooth. Inverse kinematics (IK) turns the reference point into joint angles,
+keeping the gripper pointing straight down with the fingers lined up with the
+box sides.
 
-A reference point p_ref moves toward the waypoint with a per-phase speed cap.
-A reference joint configuration q_ref tracks p_ref with damped-least-squares
-IK (position + a fixed downward orientation with the fingers aligned to the
-box faces, null-space pull to the home posture). The arm has no gravity
-compensation in this model, so a position servo sags under load; we therefore
-command ctrl = q_ref + g(q_ref) / kp, the static target at which the servo
-torque cancels gravity, and the action is the (rate-limited) change from the
-current ctrl to that target. If the box slips out of the grasp during LIFT or
-TRANSPORT the expert re-approaches it.
+One thing I had to handle: the Panda model in this env has no gravity
+compensation, so if we just command the joint angles we want, the arm sags a
+few cm under its own weight and misses the 4 cm box. So we compute the gravity
+torque at the desired angles and command angle + torque / kp instead, which is
+the target where the servo exactly cancels gravity.
 
-Everything here runs on CPU with the same mj_model the MJX env was built from.
+If the box slips out of the gripper while lifting/moving, the expert goes back
+to APPROACH and tries again.
+
+All of this runs on the CPU with plain MuJoCo, using the same model as the env.
 """
 
 import mujoco
@@ -33,214 +36,237 @@ import numpy as np
 APPROACH, DESCEND, GRASP, LIFT, TRANSPORT = range(5)
 PHASE_NAMES = ["approach", "descend", "grasp", "lift", "transport"]
 
-DEFAULT_EXPERT_CFG = {
-    "pregrasp_height": 0.06,   # m above box centre
-    "grasp_dz": 0.0,           # gripper site relative to box centre when grasping
-    "lift_height": 0.06,       # m
-    "v_approach": 0.02,        # m per control step (0.02 s)
-    "v_descend": 0.01,
-    "v_lift": 0.012,
-    "v_transport": 0.015,
-    "ref_gain": 0.35,          # fraction of remaining distance p_ref covers per step
-    "ref_tol": 0.003,          # p_ref considered at the waypoint
-    "approach_tol": 0.03,      # actual gripper within this of the pregrasp point
-    "grasp_xy_tol": 0.008,
-    "grasp_z_tol": 0.01,
-    "descend_timeout": 30,     # steps
-    "close_steps": 8,          # steps spent closing before lifting
-    "gripper_rate": 0.5,       # |action| cap for the finger actuator
-    "drop_tol": 0.03,          # box-vs-grasp offset that triggers a regrasp
-    "ik_iters": 2,
+DEFAULT_EXPERT_CONFIG = {
+    "pregrasp_height": 0.06,          # m above the box center to stop before going down
+    "grasp_height_offset": 0.0,       # where the gripper point goes relative to the box center
+    "lift_height": 0.06,              # m to lift straight up after grasping
+    "approach_speed": 0.02,           # max m per control step (one step = 0.02 s)
+    "descend_speed": 0.01,
+    "lift_speed": 0.012,
+    "transport_speed": 0.015,
+    "reference_gain": 0.35,           # reference point covers this fraction of the remaining distance per step
+    "reference_tolerance": 0.003,     # reference point counts as "at the waypoint" within this distance
+    "approach_tolerance": 0.03,       # real gripper must be this close to the pregrasp point to start descending
+    "grasp_xy_tolerance": 0.008,      # how well centered over the box before closing
+    "grasp_z_tolerance": 0.01,
+    "descend_timeout_steps": 30,      # close the gripper anyway after this many steps of descending
+    "gripper_close_steps": 8,         # steps to wait while closing before lifting
+    "gripper_max_action": 0.5,        # limit on the gripper action so it closes over ~2 steps
+    "drop_distance": 0.03,            # if the box moves this far from where it was grasped, regrasp
+    "ik_iterations": 2,
     "ik_damping": 0.05,
-    "rot_gain": 1.0,
-    "null_gain": 0.05,
-    "max_dq": 0.1,             # rad per IK iteration
-    "gravity_comp": True,
+    "orientation_gain": 1.0,
+    "nullspace_gain": 0.05,           # gentle pull toward the home pose using the 7th (extra) joint
+    "max_joint_step": 0.1,            # rad per IK iteration
+    "use_gravity_compensation": True,
 }
 
 
-def _rot_err(R, R_des):
-  """Small-angle orientation error (world frame) rotating R toward R_des."""
-  return 0.5 * (np.cross(R[:, 0], R_des[:, 0]) + np.cross(R[:, 1], R_des[:, 1])
-                + np.cross(R[:, 2], R_des[:, 2]))
+def orientation_error(current_rotation, target_rotation):
+  """Small rotation (axis * angle, world frame) that turns current_rotation toward target_rotation."""
+  error = np.zeros(3)
+  for axis in range(3):
+    error += np.cross(current_rotation[:, axis], target_rotation[:, axis])
+  return 0.5 * error
 
 
-def _downward_rotation(R_home):
-  """Gripper pointing straight down, yaw snapped so fingers close along a world axis."""
-  x = R_home[:, 0].copy()
-  x[2] = 0.0
-  yaw = np.arctan2(x[1], x[0])
+def make_downward_rotation(home_rotation):
+  """Gripper pointing straight down, turned (in 90 degree steps) so the fingers close along a world axis."""
+  x_axis = home_rotation[:, 0].copy()
+  x_axis[2] = 0.0
+  yaw = np.arctan2(x_axis[1], x_axis[0])
   yaw = np.round(yaw / (np.pi / 2)) * (np.pi / 2)
-  x = np.array([np.cos(yaw), np.sin(yaw), 0.0])
-  z = np.array([0.0, 0.0, -1.0])
-  y = np.cross(z, x)
-  return np.column_stack([x, y, z])
+  x_axis = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+  z_axis = np.array([0.0, 0.0, -1.0])
+  y_axis = np.cross(z_axis, x_axis)
+  return np.column_stack([x_axis, y_axis, z_axis])
 
 
-class ScriptedExpert:
-  """Expert for a single environment instance."""
+class ScriptedPickPlaceExpert:
+  """The expert for ONE environment (BatchedExpertController below runs one per episode)."""
 
-  def __init__(self, mj_model, action_scale, cfg=None):
-    self.cfg = {**DEFAULT_EXPERT_CFG, **(cfg or {})}
-    m = self.m = mj_model
-    self.d = mujoco.MjData(m)
+  def __init__(self, mj_model, action_scale, config=None):
+    self.config = {**DEFAULT_EXPERT_CONFIG, **(config or {})}
+    self.model = mj_model
+    self.data = mujoco.MjData(mj_model)
     self.action_scale = action_scale
 
-    jids = [m.joint(f"joint{i}").id for i in range(1, 8)]
-    self.qadr = m.jnt_qposadr[jids]
-    self.dadr = m.jnt_dofadr[jids]
-    self.jlo, self.jhi = m.jnt_range[jids].T.copy()
-    self.clo, self.chi = m.actuator_ctrlrange.T.copy()
-    self.kp = m.actuator_gainprm[:7, 0].copy()
-    self.site = m.site("gripper").id
+    arm_joint_ids = [mj_model.joint(f"joint{i}").id for i in range(1, 8)]
+    self.arm_qpos_index = mj_model.jnt_qposadr[arm_joint_ids]
+    self.arm_dof_index = mj_model.jnt_dofadr[arm_joint_ids]
+    self.joint_min, self.joint_max = mj_model.jnt_range[arm_joint_ids].T.copy()
+    self.ctrl_min, self.ctrl_max = mj_model.actuator_ctrlrange.T.copy()
+    self.servo_kp = mj_model.actuator_gainprm[:7, 0].copy()   # position servo stiffness per joint
+    self.gripper_site_id = mj_model.site("gripper").id
 
-    key = m.keyframe("home")
-    self.d.qpos[:] = key.qpos
-    self.q_home = key.qpos[self.qadr].copy()
-    mujoco.mj_kinematics(m, self.d)
-    self.R_des = _downward_rotation(self.d.site_xmat[self.site].reshape(3, 3).copy())
+    home_keyframe = mj_model.keyframe("home")
+    self.data.qpos[:] = home_keyframe.qpos
+    self.home_joint_angles = home_keyframe.qpos[self.arm_qpos_index].copy()
+    mujoco.mj_kinematics(mj_model, self.data)
+    home_rotation = self.data.site_xmat[self.gripper_site_id].reshape(3, 3).copy()
+    self.target_rotation = make_downward_rotation(home_rotation)
 
-    self._jacp = np.zeros((3, m.nv))
-    self._jacr = np.zeros((3, m.nv))
-    self._bias = np.zeros(m.nv)
+    self._position_jacobian = np.zeros((3, mj_model.nv))
+    self._rotation_jacobian = np.zeros((3, mj_model.nv))
+    self._bias_forces = np.zeros(mj_model.nv)
     self.phase = APPROACH
 
-  # -- kinematics / dynamics helpers ---------------------------------------
+  # --- kinematics and gravity ----------------------------------------------
 
-  def _fk(self, q):
-    self.d.qpos[self.qadr] = q
-    mujoco.mj_kinematics(self.m, self.d)
-    mujoco.mj_comPos(self.m, self.d)
-    return (self.d.site_xpos[self.site].copy(),
-            self.d.site_xmat[self.site].reshape(3, 3).copy())
+  def forward_kinematics(self, joint_angles):
+    """Gripper position and rotation matrix for the given arm joint angles."""
+    self.data.qpos[self.arm_qpos_index] = joint_angles
+    mujoco.mj_kinematics(self.model, self.data)
+    mujoco.mj_comPos(self.model, self.data)
+    position = self.data.site_xpos[self.gripper_site_id].copy()
+    rotation = self.data.site_xmat[self.gripper_site_id].reshape(3, 3).copy()
+    return position, rotation
 
-  def _ik(self, q, p_target):
-    c = self.cfg
-    eye6, eye7 = np.eye(6), np.eye(7)
-    for _ in range(c["ik_iters"]):
-      p, R = self._fk(q)
-      err = np.concatenate([p_target - p, c["rot_gain"] * _rot_err(R, self.R_des)])
-      mujoco.mj_jacSite(self.m, self.d, self._jacp, self._jacr, self.site)
-      J = np.vstack([self._jacp[:, self.dadr], self._jacr[:, self.dadr]])
-      J_pinv = J.T @ np.linalg.solve(J @ J.T + c["ik_damping"] ** 2 * eye6, eye6)
-      dq = J_pinv @ err + (eye7 - J_pinv @ J) @ (c["null_gain"] * (self.q_home - q))
-      dq = np.clip(dq, -c["max_dq"], c["max_dq"])
-      q = np.clip(q + dq, self.jlo + 1e-3, self.jhi - 1e-3)
-    return q
+  def solve_ik(self, joint_angles, target_position):
+    """A few damped least-squares IK steps toward target_position with the gripper pointing down."""
+    cfg = self.config
+    identity_6, identity_7 = np.eye(6), np.eye(7)
+    for _ in range(cfg["ik_iterations"]):
+      position, rotation = self.forward_kinematics(joint_angles)
+      error = np.concatenate([target_position - position,
+                              cfg["orientation_gain"] * orientation_error(rotation, self.target_rotation)])
+      mujoco.mj_jacSite(self.model, self.data, self._position_jacobian, self._rotation_jacobian,
+                        self.gripper_site_id)
+      jacobian = np.vstack([self._position_jacobian[:, self.arm_dof_index],
+                            self._rotation_jacobian[:, self.arm_dof_index]])
+      damping = cfg["ik_damping"] ** 2 * identity_6
+      jacobian_pinv = jacobian.T @ np.linalg.solve(jacobian @ jacobian.T + damping, identity_6)
+      joint_step = jacobian_pinv @ error
+      # Use the leftover (7th) degree of freedom to stay close to the home pose.
+      nullspace = identity_7 - jacobian_pinv @ jacobian
+      joint_step += nullspace @ (cfg["nullspace_gain"] * (self.home_joint_angles - joint_angles))
+      joint_step = np.clip(joint_step, -cfg["max_joint_step"], cfg["max_joint_step"])
+      joint_angles = np.clip(joint_angles + joint_step, self.joint_min + 1e-3, self.joint_max - 1e-3)
+    return joint_angles
 
-  def _gravity(self, q):
-    self.d.qpos[self.qadr] = q
-    self.d.qvel[:] = 0.0
-    mujoco.mj_kinematics(self.m, self.d)
-    mujoco.mj_comPos(self.m, self.d)
-    mujoco.mj_comVel(self.m, self.d)
-    mujoco.mj_rne(self.m, self.d, 0, self._bias)
-    return self._bias[self.dadr].copy()
+  def gravity_torques(self, joint_angles):
+    """Torque each arm joint needs to hold the arm still at these angles."""
+    self.data.qpos[self.arm_qpos_index] = joint_angles
+    self.data.qvel[:] = 0.0
+    mujoco.mj_kinematics(self.model, self.data)
+    mujoco.mj_comPos(self.model, self.data)
+    mujoco.mj_comVel(self.model, self.data)
+    mujoco.mj_rne(self.model, self.data, 0, self._bias_forces)   # zero velocity -> only gravity
+    return self._bias_forces[self.arm_dof_index].copy()
 
-  # -- control ---------------------------------------------------------------
+  # --- control ---------------------------------------------------------------
 
-  def _set_phase(self, phase):
+  def set_phase(self, phase):
     self.phase = phase
-    self.phase_t = 0
+    self.steps_in_phase = 0
 
-  def _ref_reached(self, w):
-    return np.linalg.norm(self.p_ref - w) < self.cfg["ref_tol"]
+  def reference_reached(self, waypoint):
+    return np.linalg.norm(self.reference_point - waypoint) < self.config["reference_tolerance"]
 
-  def reset(self, s):
-    self._set_phase(APPROACH)
-    self.q_ref = s["qpos"][self.qadr].astype(np.float64).copy()
-    self.p_ref = s["grip_pos"].astype(np.float64).copy()
-    self.grasp_w = None
-    self.lift_w = None
-    self.offset = np.zeros(3)
+  def reset(self, env_state):
+    self.set_phase(APPROACH)
+    self.reference_joint_angles = env_state["qpos"][self.arm_qpos_index].astype(np.float64).copy()
+    self.reference_point = env_state["grip_pos"].astype(np.float64).copy()
+    self.grasp_waypoint = None
+    self.lift_waypoint = None
+    self.grasp_offset = np.zeros(3)     # gripper position minus box position at the moment of grasping
 
-  def act(self, s):
-    c = self.cfg
-    g = s["grip_pos"].astype(np.float64)
-    b = s["box_pos"].astype(np.float64)
-    tgt = s["target_pos"].astype(np.float64)
-    self.d.qpos[:] = s["qpos"]
+  def get_action(self, env_state):
+    cfg = self.config
+    gripper_pos = env_state["grip_pos"].astype(np.float64)
+    box_pos = env_state["box_pos"].astype(np.float64)
+    target_pos = env_state["target_pos"].astype(np.float64)
+    self.data.qpos[:] = env_state["qpos"]
     up = np.array([0.0, 0.0, 1.0])
 
-    # Phase transitions (based on the current measurement).
+    # 1) Decide if we should move on to the next phase (using the current measurements).
     if self.phase == APPROACH:
-      w = b + c["pregrasp_height"] * up
-      if self._ref_reached(w) and np.linalg.norm(g - w) < c["approach_tol"]:
-        self._set_phase(DESCEND)
+      pregrasp_point = box_pos + cfg["pregrasp_height"] * up
+      if (self.reference_reached(pregrasp_point)
+          and np.linalg.norm(gripper_pos - pregrasp_point) < cfg["approach_tolerance"]):
+        self.set_phase(DESCEND)
     elif self.phase == DESCEND:
-      w = b + c["grasp_dz"] * up
-      aligned = (np.linalg.norm(g[:2] - w[:2]) < c["grasp_xy_tol"]
-                 and abs(g[2] - w[2]) < c["grasp_z_tol"])
-      if (self._ref_reached(w) and aligned) or self.phase_t >= c["descend_timeout"]:
-        self.grasp_w = self.p_ref.copy()
-        self._set_phase(GRASP)
+      grasp_point = box_pos + cfg["grasp_height_offset"] * up
+      centered = (np.linalg.norm(gripper_pos[:2] - grasp_point[:2]) < cfg["grasp_xy_tolerance"]
+                  and abs(gripper_pos[2] - grasp_point[2]) < cfg["grasp_z_tolerance"])
+      timed_out = self.steps_in_phase >= cfg["descend_timeout_steps"]
+      if (self.reference_reached(grasp_point) and centered) or timed_out:
+        self.grasp_waypoint = self.reference_point.copy()
+        self.set_phase(GRASP)
     elif self.phase == GRASP:
-      if self.phase_t >= c["close_steps"]:
-        self.offset = g - b
-        self.lift_w = self.p_ref + c["lift_height"] * up
-        self._set_phase(LIFT)
+      if self.steps_in_phase >= cfg["gripper_close_steps"]:
+        self.grasp_offset = gripper_pos - box_pos
+        self.lift_waypoint = self.reference_point + cfg["lift_height"] * up
+        self.set_phase(LIFT)
     elif self.phase == LIFT:
-      if self._ref_reached(self.lift_w):
-        self._set_phase(TRANSPORT)
-    if self.phase in (LIFT, TRANSPORT) and np.linalg.norm(g - self.offset - b) > c["drop_tol"]:
-      self._set_phase(APPROACH)  # box slipped: go back and regrasp
+      if self.reference_reached(self.lift_waypoint):
+        self.set_phase(TRANSPORT)
+    if self.phase in (LIFT, TRANSPORT):
+      box_slipped = np.linalg.norm(gripper_pos - self.grasp_offset - box_pos) > cfg["drop_distance"]
+      if box_slipped:
+        self.set_phase(APPROACH)   # go back and grasp again
 
-    # Waypoint, speed cap and gripper command for the (possibly new) phase.
+    # 2) Waypoint, speed limit and gripper command for the current phase.
     if self.phase == APPROACH:
-      w, v, close = b + c["pregrasp_height"] * up, c["v_approach"], False
+      waypoint, speed, close_gripper = box_pos + cfg["pregrasp_height"] * up, cfg["approach_speed"], False
     elif self.phase == DESCEND:
-      w, v, close = b + c["grasp_dz"] * up, c["v_descend"], False
+      waypoint, speed, close_gripper = box_pos + cfg["grasp_height_offset"] * up, cfg["descend_speed"], False
     elif self.phase == GRASP:
-      w, v, close = self.grasp_w, c["v_descend"], True
+      waypoint, speed, close_gripper = self.grasp_waypoint, cfg["descend_speed"], True
     elif self.phase == LIFT:
-      w, v, close = self.lift_w, c["v_lift"], True
+      waypoint, speed, close_gripper = self.lift_waypoint, cfg["lift_speed"], True
     else:
-      w, v, close = tgt + self.offset, c["v_transport"], True
+      waypoint, speed, close_gripper = target_pos + self.grasp_offset, cfg["transport_speed"], True
 
-    delta = w - self.p_ref
-    dist = np.linalg.norm(delta)
-    if dist > 1e-9:
-      self.p_ref = self.p_ref + delta / dist * min(v, c["ref_gain"] * dist)
+    # 3) Move the reference point toward the waypoint (slowing down near it).
+    to_waypoint = waypoint - self.reference_point
+    distance = np.linalg.norm(to_waypoint)
+    if distance > 1e-9:
+      step_length = min(speed, cfg["reference_gain"] * distance)
+      self.reference_point = self.reference_point + to_waypoint / distance * step_length
 
-    self.q_ref = self._ik(self.q_ref, self.p_ref)
-    ctrl_cmd = self.q_ref.copy()
-    if c["gravity_comp"]:
-      ctrl_cmd += self._gravity(self.q_ref) / self.kp
-    ctrl_cmd = np.clip(ctrl_cmd, self.clo[:7], self.chi[:7])
+    # 4) Joint targets from IK, plus the gravity correction.
+    self.reference_joint_angles = self.solve_ik(self.reference_joint_angles, self.reference_point)
+    desired_ctrl = self.reference_joint_angles.copy()
+    if cfg["use_gravity_compensation"]:
+      desired_ctrl += self.gravity_torques(self.reference_joint_angles) / self.servo_kp
+    desired_ctrl = np.clip(desired_ctrl, self.ctrl_min[:7], self.ctrl_max[:7])
 
-    a = np.zeros(8, dtype=np.float32)
-    a[:7] = np.clip((ctrl_cmd - s["ctrl"][:7]) / self.action_scale, -1.0, 1.0)
-    finger_target = self.clo[7] if close else self.chi[7]
-    a[7] = np.clip((finger_target - s["ctrl"][7]) / self.action_scale,
-                   -c["gripper_rate"], c["gripper_rate"])
-    self.phase_t += 1
-    return a
-
-
-def _index(snap, i):
-  return {k: v[i] for k, v in snap.items()}
+    # 5) Turn "where ctrl should be" into an action (= change of ctrl / 0.04, clipped to [-1, 1]).
+    action = np.zeros(8, dtype=np.float32)
+    action[:7] = np.clip((desired_ctrl - env_state["ctrl"][:7]) / self.action_scale, -1.0, 1.0)
+    finger_target = self.ctrl_min[7] if close_gripper else self.ctrl_max[7]
+    action[7] = np.clip((finger_target - env_state["ctrl"][7]) / self.action_scale,
+                        -cfg["gripper_max_action"], cfg["gripper_max_action"])
+    self.steps_in_phase += 1
+    return action
 
 
-class ExpertController:
-  """Batched wrapper: one ScriptedExpert (with its own MjData) per environment."""
+def get_single_env_state(batched_state, index):
+  return {name: values[index] for name, values in batched_state.items()}
 
-  def __init__(self, mj_model, action_scale, cfg=None):
+
+class BatchedExpertController:
+  """Runs one ScriptedPickPlaceExpert (each with its own MjData) per episode in the batch."""
+
+  def __init__(self, mj_model, action_scale, config=None):
     self.mj_model = mj_model
     self.action_scale = action_scale
-    self.cfg = cfg
+    self.config = config
     self.experts = []
-    self.phase = np.zeros(0, dtype=np.int8)
+    self.current_phases = np.zeros(0, dtype=np.int8)
 
-  def reset(self, snap):
-    n = len(snap["obs"])
-    while len(self.experts) < n:
-      self.experts.append(ScriptedExpert(self.mj_model, self.action_scale, self.cfg))
-    self.experts = self.experts[:n]
-    for i, e in enumerate(self.experts):
-      e.reset(_index(snap, i))
-    self.phase = np.array([e.phase for e in self.experts], dtype=np.int8)
+  def reset(self, env_state):
+    batch_size = len(env_state["obs"])
+    while len(self.experts) < batch_size:
+      self.experts.append(ScriptedPickPlaceExpert(self.mj_model, self.action_scale, self.config))
+    self.experts = self.experts[:batch_size]
+    for i, expert in enumerate(self.experts):
+      expert.reset(get_single_env_state(env_state, i))
+    self.current_phases = np.array([expert.phase for expert in self.experts], dtype=np.int8)
 
-  def act(self, snap, t):
-    actions = np.stack([e.act(_index(snap, i)) for i, e in enumerate(self.experts)])
-    self.phase = np.array([e.phase for e in self.experts], dtype=np.int8)
+  def get_action(self, env_state, step):
+    actions = np.stack([expert.get_action(get_single_env_state(env_state, i))
+                        for i, expert in enumerate(self.experts)])
+    self.current_phases = np.array([expert.phase for expert in self.experts], dtype=np.int8)
     return actions

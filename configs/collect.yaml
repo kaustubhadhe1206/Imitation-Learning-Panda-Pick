@@ -10,4 +10,4 @@ noise_std: 0.0                         # Option B: Gaussian noise on executed ac
 noise_seed: 0
 success_threshold: 0.05                # m, box-to-target distance at the final step
 verify_replay: true                    # replay stored actions open-loop and check obs match
-expert: {}                             # overrides of hw2.expert.DEFAULT_EXPERT_CFG
+expert: {}                             # changes to hw2.expert.DEFAULT_EXPERT_CONFIG, e.g. {approach_speed: 0.025}

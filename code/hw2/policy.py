@@ -1,4 +1,5 @@
-"""Diffusion Policy wrapper: normalization, loss, action sampling, EMA, controller."""
+"""Diffusion Policy: normalization, training loss, sampling actions, weight averaging,
+checkpoints, and the controller that runs the policy in the env."""
 
 import copy
 import os
@@ -14,136 +15,152 @@ from .diffusion import ConditionalUnet1D, NoiseScheduler
 
 
 class DiffusionPolicy(nn.Module):
-  """p(A_t:t+Tp | O_t-To+1:t) via DDPM on min-max normalized actions.
+  """Given the last `obs_horizon` observations, generate the next `pred_horizon` actions.
 
-  Observation/action normalizer statistics are registered buffers, so a
-  checkpoint's state_dict is self-contained.
+  The normalization numbers are stored as buffers inside the model, so a saved
+  checkpoint has everything needed to run the policy.
   """
 
-  def __init__(self, obs_dim, act_dim, obs_horizon=2, pred_horizon=16, action_horizon=8,
+  def __init__(self, obs_dim, action_dim, obs_horizon=2, pred_horizon=16, action_horizon=8,
                down_dims=(128, 256, 512), diffusion_step_embed_dim=128, kernel_size=5,
                n_groups=8, num_train_timesteps=100, num_inference_steps=100):
     super().__init__()
-    self.kwargs = dict(
-        obs_dim=obs_dim, act_dim=act_dim, obs_horizon=obs_horizon, pred_horizon=pred_horizon,
+    # Saved in the checkpoint so the same model can be rebuilt when loading.
+    self.init_args = dict(
+        obs_dim=obs_dim, action_dim=action_dim, obs_horizon=obs_horizon, pred_horizon=pred_horizon,
         action_horizon=action_horizon, down_dims=list(down_dims),
         diffusion_step_embed_dim=diffusion_step_embed_dim, kernel_size=kernel_size,
         n_groups=n_groups, num_train_timesteps=num_train_timesteps,
         num_inference_steps=num_inference_steps)
-    self.obs_dim, self.act_dim = obs_dim, act_dim
-    self.obs_horizon, self.pred_horizon, self.action_horizon = obs_horizon, pred_horizon, action_horizon
+    self.obs_dim = obs_dim
+    self.action_dim = action_dim
+    self.obs_horizon = obs_horizon
+    self.pred_horizon = pred_horizon
+    self.action_horizon = action_horizon
     self.num_inference_steps = num_inference_steps
-    self.model = ConditionalUnet1D(
-        input_dim=act_dim, global_cond_dim=obs_dim * obs_horizon,
+    self.noise_predictor = ConditionalUnet1D(
+        input_dim=action_dim, global_cond_dim=obs_dim * obs_horizon,
         diffusion_step_embed_dim=diffusion_step_embed_dim, down_dims=down_dims,
         kernel_size=kernel_size, n_groups=n_groups)
     self.noise_scheduler = NoiseScheduler(num_train_timesteps)
-    for name, dim in [("obs", obs_dim), ("act", act_dim)]:
-      self.register_buffer(f"{name}_scale", torch.ones(dim))
-      self.register_buffer(f"{name}_offset", torch.zeros(dim))
+    self.register_buffer("obs_norm_scale", torch.ones(obs_dim))
+    self.register_buffer("obs_norm_offset", torch.zeros(obs_dim))
+    self.register_buffer("action_norm_scale", torch.ones(action_dim))
+    self.register_buffer("action_norm_offset", torch.zeros(action_dim))
 
-  def set_normalizers(self, obs_norm: MinMaxNormalizer, act_norm: MinMaxNormalizer):
-    for name, norm in [("obs", obs_norm), ("act", act_norm)]:
-      getattr(self, f"{name}_scale").copy_(torch.from_numpy(norm.scale))
-      getattr(self, f"{name}_offset").copy_(torch.from_numpy(norm.offset))
+  def set_normalizers(self, obs_normalizer: MinMaxNormalizer, action_normalizer: MinMaxNormalizer):
+    self.obs_norm_scale.copy_(torch.from_numpy(obs_normalizer.scale))
+    self.obs_norm_offset.copy_(torch.from_numpy(obs_normalizer.offset))
+    self.action_norm_scale.copy_(torch.from_numpy(action_normalizer.scale))
+    self.action_norm_offset.copy_(torch.from_numpy(action_normalizer.offset))
 
   def normalize_obs(self, obs):
-    return obs * self.obs_scale + self.obs_offset
+    return obs * self.obs_norm_scale + self.obs_norm_offset
 
-  def unnormalize_act(self, nact):
-    return (nact - self.act_offset) / self.act_scale
+  def unnormalize_actions(self, normalized_actions):
+    return (normalized_actions - self.action_norm_offset) / self.action_norm_scale
 
-  def compute_loss(self, nobs, nact, generator=None):
-    """Epsilon-prediction MSE on already-normalized (B, To, D) obs and (B, Tp, A) actions."""
-    B = nact.shape[0]
-    noise = torch.randn(nact.shape, device=nact.device, generator=generator)
-    t = torch.randint(0, self.noise_scheduler.num_train_timesteps, (B,), device=nact.device,
-                      generator=generator)
-    noisy = self.noise_scheduler.add_noise(nact, noise, t)
-    pred = self.model(noisy, t, nobs.flatten(1))
-    return F.mse_loss(pred, noise)
+  def compute_loss(self, normalized_obs, normalized_actions, generator=None):
+    """Training loss: add random noise to the actions and ask the network to predict that noise.
+
+    normalized_obs: (B, obs_horizon, obs_dim), normalized_actions: (B, pred_horizon, action_dim)
+    """
+    batch_size = normalized_actions.shape[0]
+    noise = torch.randn(normalized_actions.shape, device=normalized_actions.device, generator=generator)
+    timesteps = torch.randint(0, self.noise_scheduler.num_train_timesteps, (batch_size,),
+                              device=normalized_actions.device, generator=generator)
+    noisy_actions = self.noise_scheduler.add_noise(normalized_actions, noise, timesteps)
+    predicted_noise = self.noise_predictor(noisy_actions, timesteps, normalized_obs.flatten(1))
+    return F.mse_loss(predicted_noise, noise)
 
   @torch.no_grad()
-  def predict_action(self, obs_hist, generator=None):
-    """obs_hist: raw (B, To, obs_dim) tensor -> raw (B, Tp, act_dim) action sequence."""
-    cond = self.normalize_obs(obs_hist).flatten(1)
-    nact = self.noise_scheduler.sample(
-        lambda x, t: self.model(x, t, cond),
-        (obs_hist.shape[0], self.pred_horizon, self.act_dim), obs_hist.device,
+  def predict_action_sequence(self, obs_history, generator=None):
+    """obs_history: raw (B, obs_horizon, obs_dim) -> raw actions (B, pred_horizon, action_dim)."""
+    obs_condition = self.normalize_obs(obs_history).flatten(1)
+    normalized_actions = self.noise_scheduler.generate(
+        lambda noisy, timesteps: self.noise_predictor(noisy, timesteps, obs_condition),
+        (obs_history.shape[0], self.pred_horizon, self.action_dim), obs_history.device,
         num_inference_steps=self.num_inference_steps, generator=generator)
-    return self.unnormalize_act(nact)
+    return self.unnormalize_actions(normalized_actions)
 
 
-class EMA:
-  """Exponential moving average of weights with the warmup schedule used by
-  Diffusion Policy (diffusers EMAModel, power=0.75): decay = 1 - (1 + step)^-power."""
+class ExponentialMovingAverage:
+  """Keeps a slowly-updated average copy of the weights; we evaluate with this copy.
+
+  Same warm-up as Diffusion Policy (diffusers EMAModel with power=0.75):
+  decay = 1 - (1 + num_updates) ** -power, so early on it follows the model closely.
+  """
 
   def __init__(self, model, power=0.75, max_decay=0.9999):
-    self.model = copy.deepcopy(model).eval()
-    for p in self.model.parameters():
-      p.requires_grad_(False)
-    self.power, self.max_decay, self.step = power, max_decay, 0
+    self.averaged_model = copy.deepcopy(model).eval()
+    for param in self.averaged_model.parameters():
+      param.requires_grad_(False)
+    self.power = power
+    self.max_decay = max_decay
+    self.num_updates = 0
 
   @torch.no_grad()
   def update(self, model):
-    decay = min(self.max_decay, 1.0 - (1.0 + self.step) ** -self.power)
-    self.step += 1
-    for ema_p, p in zip(self.model.parameters(), model.parameters()):
-      ema_p.mul_(decay).add_(p.detach(), alpha=1.0 - decay)
-    for ema_b, b in zip(self.model.buffers(), model.buffers()):
-      ema_b.copy_(b)
+    decay = min(self.max_decay, 1.0 - (1.0 + self.num_updates) ** -self.power)
+    self.num_updates += 1
+    for averaged_param, param in zip(self.averaged_model.parameters(), model.parameters()):
+      averaged_param.mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+    for averaged_buffer, buffer in zip(self.averaged_model.buffers(), model.buffers()):
+      averaged_buffer.copy_(buffer)
 
 
-def atomic_torch_save(obj, path):
-  """Write to a temporary file, then rename: an interrupted save never corrupts `path`."""
+def safe_torch_save(data, path):
+  """Save to a temporary file first and then rename it, so a crash mid-save never leaves a broken file."""
   path = str(path)
-  tmp = path + ".tmp"
-  torch.save(obj, tmp)
-  os.replace(tmp, path)
+  temp_path = path + ".tmp"
+  torch.save(data, temp_path)
+  os.replace(temp_path, path)
 
 
 def save_checkpoint(path, policy, extra=None):
-  atomic_torch_save({"kwargs": policy.kwargs, "state_dict": policy.state_dict(), **(extra or {})}, path)
+  safe_torch_save({"init_args": policy.init_args, "state_dict": policy.state_dict(), **(extra or {})}, path)
 
 
 def load_checkpoint(path, device):
-  ckpt = torch.load(path, map_location=device, weights_only=False)
-  policy = DiffusionPolicy(**ckpt["kwargs"]).to(device)
-  policy.load_state_dict(ckpt["state_dict"])
+  checkpoint = torch.load(path, map_location=device, weights_only=False)
+  policy = DiffusionPolicy(**checkpoint["init_args"]).to(device)
+  policy.load_state_dict(checkpoint["state_dict"])
   policy.eval()
-  return policy, ckpt
+  return policy, checkpoint
 
 
 class DiffusionPolicyController:
-  """Receding-horizon execution in a batched env.
+  """Runs the policy in the batched env, re-planning every `action_horizon` steps.
 
-  Keeps the last `obs_horizon` observations (the first one is repeated at
-  t = 0, matching the edge padding used in training). Every `action_horizon`
-  steps it samples a new (Tp, A) action sequence and executes actions
-  [To - 1, To - 1 + Ta), i.e. those aligned with the current time step.
+  It remembers the last `obs_horizon` observations (at the first step the
+  first observation is repeated, same as the padding in training). When it runs
+  out of planned actions it generates a new sequence of pred_horizon actions and
+  executes the ones that line up with the current step:
+  [obs_horizon - 1, obs_horizon - 1 + action_horizon).
   """
 
   def __init__(self, policy, device, seed=0, action_horizon=None):
     self.policy = policy
     self.device = device
-    self.To = policy.obs_horizon
-    self.Ta = action_horizon or policy.action_horizon
+    self.obs_horizon = policy.obs_horizon
+    self.action_horizon = action_horizon or policy.action_horizon
     self.generator = torch.Generator(device=device)
     self.generator.manual_seed(seed)
-    self.num_inferences = 0
+    self.num_policy_calls = 0
 
-  def reset(self, snap):
-    obs = snap["obs"].astype(np.float32)
-    self.history = deque([obs] * self.To, maxlen=self.To)
-    self.queue = []
+  def reset(self, env_state):
+    first_obs = env_state["obs"].astype(np.float32)
+    self.obs_history = deque([first_obs] * self.obs_horizon, maxlen=self.obs_horizon)
+    self.planned_actions = []
 
-  def act(self, snap, t):
-    if t > 0:
-      self.history.append(snap["obs"].astype(np.float32))
-    if not self.queue:
-      obs_hist = torch.from_numpy(np.stack(self.history, axis=1)).to(self.device)
-      actions = self.policy.predict_action(obs_hist, generator=self.generator).cpu().numpy()
-      start = self.To - 1
-      self.queue = [actions[:, k] for k in range(start, start + self.Ta)]
-      self.num_inferences += 1
-    return np.clip(self.queue.pop(0), -1.0, 1.0)
+  def get_action(self, env_state, step):
+    if step > 0:
+      self.obs_history.append(env_state["obs"].astype(np.float32))
+    if not self.planned_actions:
+      obs_history = torch.from_numpy(np.stack(self.obs_history, axis=1)).to(self.device)
+      action_sequence = self.policy.predict_action_sequence(obs_history, generator=self.generator)
+      action_sequence = action_sequence.cpu().numpy()
+      first = self.obs_horizon - 1
+      self.planned_actions = [action_sequence[:, k] for k in range(first, first + self.action_horizon)]
+      self.num_policy_calls += 1
+    return np.clip(self.planned_actions.pop(0), -1.0, 1.0)

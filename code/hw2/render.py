@@ -1,9 +1,9 @@
-"""Offline rendering of recorded trajectories (qpos + target) to frames / MP4.
+"""Turning saved trajectories (joint positions + target) into images and MP4 videos.
 
-Rendering from stored qpos (instead of from live MJX states) means any
-demonstration or evaluation rollout can be re-rendered later from the saved
-.npz without re-simulating. Uses the same default free camera as the course
-README's GIFs.
+We render from the saved qpos instead of from live simulator states, so any
+demo or evaluation episode can be re-rendered later from the .npz file
+without running the simulation again. The camera is the same default view as
+in the course README GIFs.
 """
 
 from pathlib import Path
@@ -16,21 +16,22 @@ class TrajectoryRenderer:
   def __init__(self, mj_model, height=480, width=640, camera=-1):
     import mujoco
     self._mujoco = mujoco
-    self.m = mj_model
-    self.d = mujoco.MjData(mj_model)
+    self.model = mj_model
+    self.data = mujoco.MjData(mj_model)
     self.renderer = mujoco.Renderer(mj_model, height=height, width=width)
     self.camera = camera
-    self.mocap = int(mj_model.body("mocap_target").mocapid[0])
+    self.target_mocap_id = int(mj_model.body("mocap_target").mocapid[0])
 
-  def render(self, qpos_seq, target_pos, every=1):
+  def render_frames(self, qpos_sequence, target_position, every_nth=1):
+    """One image per saved state (every_nth=2 keeps every second state)."""
     frames = []
-    for q in qpos_seq[::every]:
-      self.d.qpos[:] = q
-      self.d.qvel[:] = 0.0
-      self.d.mocap_pos[self.mocap] = target_pos
-      self.d.mocap_quat[self.mocap] = [1.0, 0.0, 0.0, 0.0]
-      self._mujoco.mj_forward(self.m, self.d)
-      self.renderer.update_scene(self.d, camera=self.camera)
+    for qpos in qpos_sequence[::every_nth]:
+      self.data.qpos[:] = qpos
+      self.data.qvel[:] = 0.0
+      self.data.mocap_pos[self.target_mocap_id] = target_position
+      self.data.mocap_quat[self.target_mocap_id] = [1.0, 0.0, 0.0, 0.0]
+      self._mujoco.mj_forward(self.model, self.data)
+      self.renderer.update_scene(self.data, camera=self.camera)
       frames.append(self.renderer.render().copy())
     return frames
 
@@ -38,51 +39,45 @@ class TrajectoryRenderer:
     self.renderer.close()
 
 
-def annotate(frames, text, color=(255, 255, 255)):
-  """Burn a caption into the top-left corner of each frame (best effort)."""
+def add_caption(frames, text, color=(255, 255, 255)):
+  """Write a caption in the top-left corner of every frame (skipped if Pillow is missing)."""
   try:
     from PIL import Image, ImageDraw
   except ImportError:
     return frames
-  out = []
-  for f in frames:
-    img = Image.fromarray(f)
-    draw = ImageDraw.Draw(img)
+  captioned = []
+  for frame in frames:
+    image = Image.fromarray(frame)
+    draw = ImageDraw.Draw(image)
     draw.rectangle([0, 0, 8 + 7 * len(text), 22], fill=(0, 0, 0))
     draw.text((4, 5), text, fill=color)
-    out.append(np.asarray(img))
-  return out
+    captioned.append(np.asarray(image))
+  return captioned
 
 
-def tile(videos, cols):
-  """Tile equal-length lists of frames into a grid video."""
-  n = len(videos)
-  rows = int(np.ceil(n / cols))
-  length = max(len(v) for v in videos)
-  h, w, _ = videos[0][0].shape
-  blank = np.zeros((h, w, 3), dtype=np.uint8)
-  out = []
-  for t in range(length):
-    grid = []
-    for r in range(rows):
-      row = []
-      for c in range(cols):
-        k = r * cols + c
-        row.append(videos[k][min(t, len(videos[k]) - 1)] if k < n else blank)
-      grid.append(np.concatenate(row, axis=1))
-    out.append(np.concatenate(grid, axis=0))
-  return out
+def tile_videos(videos, num_columns):
+  """Put several videos (lists of frames) next to each other in a grid."""
+  num_videos = len(videos)
+  num_rows = int(np.ceil(num_videos / num_columns))
+  num_frames = max(len(video) for video in videos)
+  height, width, _ = videos[0][0].shape
+  blank = np.zeros((height, width, 3), dtype=np.uint8)
+  tiled = []
+  for t in range(num_frames):
+    rows = []
+    for row in range(num_rows):
+      tiles = []
+      for col in range(num_columns):
+        k = row * num_columns + col
+        tiles.append(videos[k][min(t, len(videos[k]) - 1)] if k < num_videos else blank)
+      rows.append(np.concatenate(tiles, axis=1))
+    tiled.append(np.concatenate(rows, axis=0))
+  return tiled
 
 
-def write_video(path, frames, fps):
+def save_video(path, frames, fps):
   import imageio.v2 as imageio
   path = Path(path)
   path.parent.mkdir(parents=True, exist_ok=True)
   imageio.mimwrite(path, frames, fps=fps, codec="libx264", quality=7, macro_block_size=1)
   return path
-
-
-def render_episode(renderer, result, i, fps_every=2, caption=None):
-  """Frames for episode i of a rollout result (every `fps_every`-th state)."""
-  frames = renderer.render(result["qpos"][i], result["target_pos"][i], every=fps_every)
-  return annotate(frames, caption) if caption else frames
