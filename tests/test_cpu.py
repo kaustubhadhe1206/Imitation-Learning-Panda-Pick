@@ -210,8 +210,13 @@ def test_config_overrides():
 
 
 def test_training_resume_gives_same_model():
-  """Stopping and continuing training must give exactly the same model as training in one go."""
+  """Stopping and continuing training must give exactly the same model as training in one go.
+
+  Runs on the CPU on purpose: GPU convolutions add numbers in a slightly different
+  order every run, so even two uninterrupted GPU runs differ in the last digits.
+  """
   import train as train_script
+  cpu = "cpu"
   with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
     rng = np.random.default_rng(0)
@@ -222,10 +227,11 @@ def test_training_resume_gives_same_model():
         f"data.path={(tmp / 'demos.npz').as_posix()}", "data.num_demos=4", "policy.down_dims=[8,16,32]",
         "policy.diffusion_step_embed_dim=8", "policy.num_train_timesteps=10", "train.num_steps=30",
         "train.batch_size=8", "train.warmup_steps=5", "train.log_every=5", "train.save_every=10"])
-    train_script.train(config, tmp / "in_one_go")
-    assert train_script.train(config, tmp / "resumed", stop_after=15) is None   # pretend Colab died at step 15
+    train_script.train(config, tmp / "in_one_go", device=cpu)
+    # pretend Colab died at step 15, then continue to the end
+    assert train_script.train(config, tmp / "resumed", stop_after=15, device=cpu) is None
     assert (tmp / "resumed" / "train_state.pt").exists()
-    train_script.train(config, tmp / "resumed")                                 # continue to the end
+    train_script.train(config, tmp / "resumed", device=cpu)
     assert not (tmp / "resumed" / "train_state.pt").exists()
     weights_a = torch.load(tmp / "in_one_go" / "checkpoint.pt", weights_only=False)["state_dict"]
     weights_b = torch.load(tmp / "resumed" / "checkpoint.pt", weights_only=False)["state_dict"]
@@ -237,9 +243,9 @@ def test_training_resume_gives_same_model():
     # continuing with a different config must be refused
     different_config = dict(config, seed=1)
     (tmp / "resumed" / "checkpoint.pt").unlink()
-    train_script.train(different_config, tmp / "resumed", stop_after=5)
+    train_script.train(different_config, tmp / "resumed", stop_after=5, device=cpu)
     try:
-      train_script.train(config, tmp / "resumed")
+      train_script.train(config, tmp / "resumed", device=cpu)
       raise AssertionError("continuing with a different config should fail")
     except RuntimeError:
       pass

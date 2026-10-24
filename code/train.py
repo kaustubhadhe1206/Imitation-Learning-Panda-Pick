@@ -62,11 +62,14 @@ def settings_that_must_match(config):
                                               "warmup_steps", "ema_power"]})
 
 
-def train(config, run_dir, stop_after=None):
+def train(config, run_dir, stop_after=None, device=None):
+  """Train one policy. device=None means use the GPU if there is one."""
   run_dir = Path(run_dir)
   run_dir.mkdir(parents=True, exist_ok=True)
   utils.set_random_seed(config["seed"])
-  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  if device is None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+  device = torch.device(device)
   policy_config, train_config = config["policy"], config["train"]
 
   # --- data ---
