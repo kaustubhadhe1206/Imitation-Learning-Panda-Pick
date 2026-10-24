@@ -201,6 +201,41 @@ def test_config_overrides():
   assert 0.40 < lo < 0.41 and 0.59 < hi < 0.60
 
 
+def test_train_resume_is_exact():
+  """Interrupt-and-resume must produce exactly the same model as an uninterrupted run."""
+  import train as train_mod
+  with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    rng = np.random.default_rng(0)
+    obs = rng.random((4, 30, OBS_DIM), dtype=np.float32)
+    np.savez(d / "demos.npz", obs=obs, actions=np.tanh(obs[..., :ACT_DIM]), seeds=np.arange(4),
+             success=np.ones(4, bool))
+    cfg = utils.load_config("configs/dp_base.yaml", [
+        f"data.path={(d / 'demos.npz').as_posix()}", "data.num_demos=4", "policy.down_dims=[8,16,32]",
+        "policy.diffusion_step_embed_dim=8", "policy.num_train_timesteps=10", "train.num_steps=30",
+        "train.batch_size=8", "train.warmup_steps=5", "train.log_every=5", "train.save_every=10"])
+    train_mod.train(cfg, d / "full")
+    assert train_mod.train(cfg, d / "resumed", stop_after=15) is None          # "disconnect" at step 15
+    assert (d / "resumed" / "train_state.pt").exists()
+    train_mod.train(cfg, d / "resumed")                                        # resume to the end
+    assert not (d / "resumed" / "train_state.pt").exists()
+    a = torch.load(d / "full" / "checkpoint.pt", weights_only=False)["state_dict"]
+    b = torch.load(d / "resumed" / "checkpoint.pt", weights_only=False)["state_dict"]
+    for k in a:
+      assert torch.equal(a[k], b[k]), k
+    loss_a = (d / "full" / "loss.csv").read_text().splitlines()
+    loss_b = (d / "resumed" / "loss.csv").read_text().splitlines()
+    assert [r.split(",")[:2] for r in loss_a] == [r.split(",")[:2] for r in loss_b]
+    bad = dict(cfg, seed=1)
+    (d / "resumed" / "checkpoint.pt").unlink()
+    train_mod.train(bad, d / "resumed", stop_after=5)
+    try:
+      train_mod.train(cfg, d / "resumed")
+      raise AssertionError("resuming with a different config must fail")
+    except RuntimeError:
+      pass
+
+
 def test_analysis_and_demo_figures():
   import analyze
   import inspect_demos

@@ -230,8 +230,10 @@ if RUN_SANITY:
 md(r"""
 ## Parts 2-3: Train + evaluate the dataset-size sweep (resumable)
 Runs `configs/sweep.yaml` (100 / 50 / 25 demos x seeds 0, 1, 2). Each finished run is copied to
-Drive and pushed to GitHub immediately. Checkpoints are written straight to Drive, so a run whose training
-finished is not retrained. If the session dies, reconnect, run cells 0-2 (incl. 1b), then this cell again.
+Drive and pushed to GitHub immediately. Training writes a resumable state to Drive every 2000 steps
+(`runs/<run>/train_state.pt`), and a finished run's checkpoint is never retrained. If the session dies,
+reconnect, run cells 0-2 (incl. 1b), then this cell again: finished runs are skipped, and the interrupted run
+continues from its last saved step.
 """)
 
 code(r"""

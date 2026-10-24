@@ -22,6 +22,7 @@ train:
   warmup_steps: 500
   ema_power: 0.75
   log_every: 100
+  save_every: 2000                     # resumable training state (runs/<run>/train_state.pt)
 eval:
   num_episodes: 100                    # held-out initial conditions
   seed_offset: 100000                  # eval seeds 100000..100099, disjoint from demo seeds

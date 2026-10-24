@@ -1,6 +1,7 @@
 """Diffusion Policy wrapper: normalization, loss, action sampling, EMA, controller."""
 
 import copy
+import os
 from collections import deque
 
 import numpy as np
@@ -93,8 +94,16 @@ class EMA:
       ema_b.copy_(b)
 
 
+def atomic_torch_save(obj, path):
+  """Write to a temporary file, then rename: an interrupted save never corrupts `path`."""
+  path = str(path)
+  tmp = path + ".tmp"
+  torch.save(obj, tmp)
+  os.replace(tmp, path)
+
+
 def save_checkpoint(path, policy, extra=None):
-  torch.save({"kwargs": policy.kwargs, "state_dict": policy.state_dict(), **(extra or {})}, path)
+  atomic_torch_save({"kwargs": policy.kwargs, "state_dict": policy.state_dict(), **(extra or {})}, path)
 
 
 def load_checkpoint(path, device):
